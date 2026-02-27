@@ -123,7 +123,7 @@ func WithRequestID(next http.Handler) http.Handler {
 
 // 获取 request-id
 func GetRequestID(ctx context.Context) string {
-	ctx.Value(requestIDKey).(string)
+	return ctx.Value(requestIDKey).(string)
 }
 
 func Handle(rw http.ResponseWriter, req *http.Request) {
