@@ -1,10 +1,10 @@
 ---
-title: Go 程序员面试笔试宝典
+title: Go宝典
 ---
 
 <img src="assets/cover.png" alt="logo" height="480" align="right" style="margin: 5px; margin-bottom: 20px;" />
 
-# Go 程序员面试笔试宝典
+# Go宝典
 
 _作者_: [饶全成](https://qcrao.com), [欧长坤](https://changkun.de), 楚秦 等编著<br/>
 _ISBN_: 978-7-111-70242-9<br/>
