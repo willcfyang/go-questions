@@ -1,0 +1,2140 @@
+<!DOCTYPE html>
+<html lang="en" dir="ltr">
+
+<head>
+  <meta name="generator" content="Hugo 0.159.0">
+  <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="description" content="上一讲说到调度器将 main goroutine 推上舞台，为它铺好了道路，开始执行 runtime.main 函数。这一讲，我们探索 main goroutine 以及普通 goroutine 从执行到退出的整个过程。
+
+
+ 1
+ 2
+ 3
+ 4
+ 5
+ 6
+ 7
+ 8
+ 9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+34
+35
+36
+37
+38
+39
+40
+41
+42
+43
+44
+45
+46
+47
+48
+49
+50
+51
+52
+53
+54
+55
+56
+57
+58
+59
+60
+61
+62
+63
+64
+65
+66
+67
+68
+69
+70
+71
+72
+73
+74
+75
+76
+77
+78
+79
+
+
+// The main goroutine.
+func main() {
+    // g = main goroutine，不再是 g0 了
+    g := getg()
+
+    // ……………………
+
+    if sys.PtrSize == 8 {
+        maxstacksize = 1000000000
+    } else {
+        maxstacksize = 250000000
+    }
+
+    // Allow newproc to start new Ms.
+    mainStarted = true
+
+    systemstack(func() {
+        // 创建监控线程，该线程独立于调度器，不需要跟 p 关联即可运行
+        newm(sysmon, nil)
+    })
+
+    lockOSThread()
+
+    if g.m != &amp;m0 {
+        throw(&#34;runtime.main not on m0&#34;)
+    }
+
+    // 调用 runtime 包的初始化函数，由编译器实现
+    runtime_init() // must be before defer
+    if nanotime() == 0 {
+        throw(&#34;nanotime returning zero&#34;)
+    }
+
+    // Defer unlock so that runtime.Goexit during init does the unlock too.
+    needUnlock := true
+    defer func() {
+        if needUnlock {
+            unlockOSThread()
+        }
+    }()
+
+    // Record when the world started. Must be after runtime_init
+    // because nanotime on some platforms depends on startNano.
+    runtimeInitTime = nanotime()
+
+    // 开启垃圾回收器
+    gcenable()
+
+    main_init_done = make(chan bool)
+    
+    // ……………………
+
+    // main 包的初始化，递归的调用我们 import 进来的包的初始化函数
+    fn := main_init
+    fn()
+    close(main_init_done)
+
+    needUnlock = false
+    unlockOSThread()
+
+    // ……………………
+    
+    // 调用 main.main 函数
+    fn = main_main
+    fn()
+    if raceenabled {
+        racefini()
+    }
+
+    // ……………………
+
+    // 进入系统调用，退出进程，可以看出 main goroutine 并未返回，而是直接进入系统调用退出进程了
+    exit(0)
+    // 保护性代码，如果 exit 意外返回，下面的代码会让该进程 crash 死掉
+    for {
+        var x *int32
+        *x = 0
+    }
+}
+
+
+main 函数执行流程如下图：">
+<meta name="theme-color" content="#FFFFFF"><meta property="og:url" content="http://golang.design/go-questions/sched/goroutine-exit/">
+  <meta property="og:site_name" content="Go宝典">
+  <meta property="og:title" content="goroutine 如何退出">
+  <meta property="og:description" content="上一讲说到调度器将 main goroutine 推上舞台，为它铺好了道路，开始执行 runtime.main 函数。这一讲，我们探索 main goroutine 以及普通 goroutine 从执行到退出的整个过程。
+1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 // The main goroutine. func main() { // g = main goroutine，不再是 g0 了 g := getg() // …………………… if sys.PtrSize == 8 { maxstacksize = 1000000000 } else { maxstacksize = 250000000 } // Allow newproc to start new Ms. mainStarted = true systemstack(func() { // 创建监控线程，该线程独立于调度器，不需要跟 p 关联即可运行 newm(sysmon, nil) }) lockOSThread() if g.m != &amp;m0 { throw(&#34;runtime.main not on m0&#34;) } // 调用 runtime 包的初始化函数，由编译器实现 runtime_init() // must be before defer if nanotime() == 0 { throw(&#34;nanotime returning zero&#34;) } // Defer unlock so that runtime.Goexit during init does the unlock too. needUnlock := true defer func() { if needUnlock { unlockOSThread() } }() // Record when the world started. Must be after runtime_init // because nanotime on some platforms depends on startNano. runtimeInitTime = nanotime() // 开启垃圾回收器 gcenable() main_init_done = make(chan bool) // …………………… // main 包的初始化，递归的调用我们 import 进来的包的初始化函数 fn := main_init fn() close(main_init_done) needUnlock = false unlockOSThread() // …………………… // 调用 main.main 函数 fn = main_main fn() if raceenabled { racefini() } // …………………… // 进入系统调用，退出进程，可以看出 main goroutine 并未返回，而是直接进入系统调用退出进程了 exit(0) // 保护性代码，如果 exit 意外返回，下面的代码会让该进程 crash 死掉 for { var x *int32 *x = 0 } } main 函数执行流程如下图：">
+  <meta property="og:locale" content="zh_CN">
+  <meta property="og:type" content="article">
+    <meta property="article:section" content="sched">
+<title>goroutine 如何退出 | Go宝典</title>
+<link rel="manifest" href="/go-questions/manifest.json">
+<link rel="icon" href="/go-questions/favicon.png" type="image/x-icon">
+<link rel="stylesheet" href="/go-questions/book.min.1026023dd873ce4c1427154fefa84d5022ba06f21fb7ebc0bc90c8c5295f58e3.css" integrity="sha256-ECYCPdhzzkwUJxVP76hNUCK6BvIft&#43;vAvJDIxSlfWOM=">
+<script defer src="/go-questions/en.search.min.a56febd3574db773904404c574762b15faf999f15aae7956d7234ead17a2768a.js" integrity="sha256-pW/r01dNt3OQRATFdHYrFfr5mfFarnlW1yNOrReidoo="></script>
+<!--
+Made with Book Theme
+https://github.com/alex-shpak/hugo-book
+-->
+
+
+
+  <script type="text/javascript" async
+src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.5/MathJax.js?config=TeX-MML-AM_CHTML">
+MathJax.Hub.Config({
+  tex2jax: {
+    inlineMath: [['$','$'], ['\\(','\\)']],
+    displayMath: [['$$','$$']],
+    processEscapes: true,
+    processEnvironments: true,
+    skipTags: ['script', 'noscript', 'style', 'textarea', 'pre'],
+    TeX: { equationNumbers: { autoNumber: "AMS" },
+         extensions: ["AMSmath.js", "AMSsymbols.js"] }
+  }
+  });
+  MathJax.Hub.Queue(function() {
+    
+    
+    
+    var all = MathJax.Hub.getAllJax(), i;
+    for(i = 0; i < all.length; i += 1) {
+        all[i].SourceElement().parentNode.className += ' has-jax';
+    }
+  });
+
+  MathJax.Hub.Config({
+  
+  TeX: { equationNumbers: { autoNumber: "AMS" } }
+  });
+</script>
+<script async src="//changkun.de/urlstat/client.js"></script>
+</head>
+
+<body dir="ltr">
+  <input type="checkbox" class="hidden toggle" id="menu-control" />
+  <input type="checkbox" class="hidden toggle" id="toc-control" />
+  <main class="container flex">
+    <aside class="book-menu">
+      <div class="book-menu-content">
+        
+  <nav>
+<h2 class="book-brand">
+  <a href="/go-questions"><span>Go宝典</span>
+  </a>
+</h2>
+
+
+<div class="book-search">
+  <input type="text" id="book-search-input" placeholder="" aria-label="" maxlength="64" data-hotkeys="s/" />
+  <div class="book-search-spinner hidden"></div>
+  <ul id="book-search-results"></ul>
+</div>
+
+
+
+<ul>
+    <li><a href="https://github.com/golang-design/Go-Questions">GitHub</a></li>
+</ul>
+<hr>
+
+
+
+
+
+
+
+  
+
+
+
+  
+  <ul>
+    
+      
+        <li class="book-section-flat" >
+          
+  
+  
+
+  
+    <input type="checkbox" id="section-a65dabd6eab2d958720d860b517524f2" class="toggle"  />
+    <label for="section-a65dabd6eab2d958720d860b517524f2" class="flex justify-between">
+      <a  class="">数组与切片</a>
+      <span>▾</span>
+    </label>
+  
+
+          
+  <ul>
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/slice/vs-array/" class="">数组与切片有什么异同</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/slice/grow/" class="">切片的容量是怎样增长的</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/slice/as-func-param/" class="">切片作为函数参数</a>
+  
+
+        </li>
+      
+    
+  </ul>
+
+        </li>
+      
+    
+      
+        <li class="book-section-flat" >
+          
+  
+  
+
+  
+    <input type="checkbox" id="section-40cb9c7d0ae8dd5d6dc59eea44d4f024" class="toggle"  />
+    <label for="section-40cb9c7d0ae8dd5d6dc59eea44d4f024" class="flex justify-between">
+      <a  class="">哈希表</a>
+      <span>▾</span>
+    </label>
+  
+
+          
+  <ul>
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/principal/" class="">map 的实现原理</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/get/" class="">如何实现两种 get 操作</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/range/" class="">遍历过程</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/assign/" class="">赋值过程</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/delete/" class="">删除过程</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/extend/" class="">扩容过程</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/unordered/" class="">key 为什么是无序的</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/float-as-key/" class="">float 类型可以作为 map 的 key 吗</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/delete-on-range/" class="">可以边遍历边删除吗</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/element-address/" class="">可以对 map 的元素取地址吗</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/compare/" class="">如何比较两个 map 相等</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/thread-safety/" class="">map 是线程安全的吗</a>
+  
+
+        </li>
+      
+    
+  </ul>
+
+        </li>
+      
+    
+      
+        <li class="book-section-flat" >
+          
+  
+  
+
+  
+    <input type="checkbox" id="section-eb16f3b57ba50e2a28f637e99054e45f" class="toggle"  />
+    <label for="section-eb16f3b57ba50e2a28f637e99054e45f" class="flex justify-between">
+      <a  class="">接口</a>
+      <span>▾</span>
+    </label>
+  
+
+          
+  <ul>
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/interface/duck-typing/" class="">Go 语言与鸭子类型的关系</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/interface/receiver/" class="">值接收者和指针接收者的区别</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/interface/iface-eface/" class="">iface 和 eface 的区别是什么</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/interface/dynamic-typing/" class="">接口的动态类型和动态值</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/interface/detect-impl/" class="">编译器自动检测类型是否实现接口</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/interface/construct/" class="">接口的构造过程是怎样的</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/interface/assert/" class="">类型转换和断言的区别</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/interface/convert/" class="">接口转换的原理</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/interface/polymorphism/" class="">如何用 interface 实现多态</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/interface/compare-to-cpp/" class="">Go 接口与 C&#43;&#43; 接口有何异同</a>
+  
+
+        </li>
+      
+    
+  </ul>
+
+        </li>
+      
+    
+      
+        <li class="book-section-flat" >
+          
+  
+  
+
+  
+    <input type="checkbox" id="section-c48fe4210547e2736252b7130a8fb35b" class="toggle"  />
+    <label for="section-c48fe4210547e2736252b7130a8fb35b" class="flex justify-between">
+      <a  class="">通道</a>
+      <span>▾</span>
+    </label>
+  
+
+          
+  <ul>
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/csp/" class="">什么是 CSP</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/struct/" class="">channel 底层的数据结构是什么</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/send/" class="">向 channel 发送数据的过程是怎样的</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/recv/" class="">从 channel 接收数据的过程是怎样的</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/close/" class="">关闭一个 channel 的过程是怎样的</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/read-on-close/" class="">从一个关闭的 channel 仍然能读出数据吗</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/ops/" class="">操作 channel 的情况总结</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/graceful-close/" class="">如何优雅地关闭 channel</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/principal/" class="">channel 发送和接收元素的本质是什么</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/leak/" class="">channel 在什么情况下会引起资源泄漏</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/happens-before/" class="">关于 channel 的 happened-before 有哪些</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/application/" class="">channel 有哪些应用</a>
+  
+
+        </li>
+      
+    
+  </ul>
+
+        </li>
+      
+    
+      
+        <li class="book-section-flat" >
+          
+  
+  
+
+  
+    <input type="checkbox" id="section-cf459139b27c2842a7aade68823220c5" class="toggle"  />
+    <label for="section-cf459139b27c2842a7aade68823220c5" class="flex justify-between">
+      <a  class="">标准库</a>
+      <span>▾</span>
+    </label>
+  
+
+          
+  <ul>
+    
+      
+        <li class="book-section-flat" >
+          
+  
+  
+
+  
+    <input type="checkbox" id="section-ec17239161d133f75c434cb014289362" class="toggle"  />
+    <label for="section-ec17239161d133f75c434cb014289362" class="flex justify-between">
+      <a  class="">context</a>
+      <span>▾</span>
+    </label>
+  
+
+          
+  <ul>
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/context/what/" class="">context 是什么</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/context/why/" class="">context 有什么作用</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/context/find-value/" class="">context.Value 的查找过程是怎样的</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/context/cancel/" class="">context 如何被取消</a>
+  
+
+        </li>
+      
+    
+  </ul>
+
+        </li>
+      
+    
+      
+        <li class="book-section-flat" >
+          
+  
+  
+
+  
+    <input type="checkbox" id="section-0bb1f278e21c7193888a989985c0b0ee" class="toggle"  />
+    <label for="section-0bb1f278e21c7193888a989985c0b0ee" class="flex justify-between">
+      <a  class="">reflect</a>
+      <span>▾</span>
+    </label>
+  
+
+          
+  <ul>
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/reflect/what/" class="">什么是反射</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/reflect/why/" class="">什么情况下需要使用反射</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/reflect/how/" class="">Go 语言如何实现反射</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/reflect/application/" class="">Go 语言中反射有哪些应用</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/reflect/compare/" class="">如何比较两个对象完全相同</a>
+  
+
+        </li>
+      
+    
+  </ul>
+
+        </li>
+      
+    
+      
+        <li class="book-section-flat" >
+          
+  
+  
+
+  
+    <input type="checkbox" id="section-26a1f92d5bf0434e0b92a598ca6e7fb9" class="toggle"  />
+    <label for="section-26a1f92d5bf0434e0b92a598ca6e7fb9" class="flex justify-between">
+      <a  class="">unsafe</a>
+      <span>▾</span>
+    </label>
+  
+
+          
+  <ul>
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/unsafe/pointers/" class="">Go指针和unsafe.Pointer有什么区别</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/unsafe/len/" class="">如何利用unsafe获取slice&amp;map的长度</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/unsafe/modify-private/" class="">如何利用unsafe包修改私有成员</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/unsafe/zero-conv/" class="">如何实现字符串和byte切片的零拷贝转换</a>
+  
+
+        </li>
+      
+    
+  </ul>
+
+        </li>
+      
+    
+  </ul>
+
+        </li>
+      
+    
+      
+        <li class="book-section-flat" >
+          
+  
+  
+
+  
+    <input type="checkbox" id="section-66bb7ef66e8598ada01c7f825054049f" class="toggle"  />
+    <label for="section-66bb7ef66e8598ada01c7f825054049f" class="flex justify-between">
+      <a  class="">编译</a>
+      <span>▾</span>
+    </label>
+  
+
+          
+  <ul>
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/compile/escape/" class="">逃逸分析是怎么进行的</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/compile/gopath/" class="">GoRoot 和 GoPath 有什么用</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/compile/link-process/" class="">Go 编译链接过程概述</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/compile/cmd/" class="">Go 编译相关的命令详解</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/compile/booting/" class="">Go 程序启动过程是怎样的</a>
+  
+
+        </li>
+      
+    
+  </ul>
+
+        </li>
+      
+    
+      
+        <li class="book-section-flat" >
+          
+  
+  
+
+  
+    <input type="checkbox" id="section-b8b0dd60ee3ee64dc6ccaf3bced28b29" class="toggle" checked />
+    <label for="section-b8b0dd60ee3ee64dc6ccaf3bced28b29" class="flex justify-between">
+      <a  class="">调度器</a>
+      <span>▾</span>
+    </label>
+  
+
+          
+  <ul>
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/goroutine-vs-thread/" class="">goroutine 和线程的区别</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/what-is/" class="">什么是 Go Scheduler</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/when/" class="">goroutine 调度时机有哪些</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/mn-model/" class="">什么是M:N模型</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/work-steal/" class="">什么是工作窃取</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/gpm/" class="">GPM 是什么</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/init/" class="">描述 scheduler 的初始化过程</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/main-goroutine/" class="">主 goroutine 如何创建</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/g0-stack/" class="">g0 栈何用户栈如何切换</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/sched-loop-boot/" class="">schedule 循环如何启动</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/goroutine-exit/" class=" active">goroutine 如何退出</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/sched-loop-exec/" class="">schedule 循环如何运转</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/m-worker/" class="">M 如何找工作</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/sysmon/" class="">sysmon 后台监控线程做了什么</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/sched-trap/" class="">一个调度相关的陷阱</a>
+  
+
+        </li>
+      
+    
+  </ul>
+
+        </li>
+      
+    
+      
+        <li class="book-section-flat" >
+          
+  
+  
+
+  
+    <input type="checkbox" id="section-49561050d01c571480cc1c3317ee29d7" class="toggle"  />
+    <label for="section-49561050d01c571480cc1c3317ee29d7" class="flex justify-between">
+      <a  class="">垃圾回收器</a>
+      <span>▾</span>
+    </label>
+  
+
+          
+  <ul>
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/memgc/principal/" class="">垃圾回收的认识</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/memgc/impl/" class="">垃圾回收机制的实现</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/memgc/optimize/" class="">垃圾回收的优化问题</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/memgc/history/" class="">历史及演进</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/memgc/summary/" class="">总结</a>
+  
+
+        </li>
+      
+    
+  </ul>
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/errata/" class="">勘误表</a>
+  
+
+        </li>
+      
+    
+  </ul>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<hr>
+<ul>
+<li style="font-style:italic">
+</li>
+</ul>
+版权所有 &copy; 2022 <a href="https://qcrao.com">饶全成</a>, <a href="https://changkun.de">欧长坤</a>, 楚秦等<br/><br/>
+
+The <a href="https://golang.design">golang.design</a> Initialtive
+</nav>
+
+
+
+
+  <script>(function(){var e=document.querySelector("aside.book-menu nav");addEventListener("beforeunload",function(){localStorage.setItem("menu.scrollTop",e.scrollTop)}),e.scrollTop=localStorage.getItem("menu.scrollTop")})()</script>
+
+
+ 
+      </div>
+    </aside>
+
+    <div class="book-page">
+      <header class="book-header">
+        
+  <div class="flex align-center justify-between">
+  <label for="menu-control">
+    <img src="/go-questions/svg/menu.svg" class="book-icon" alt="Menu" />
+  </label>
+
+  <strong>goroutine 如何退出</strong>
+
+  <label for="toc-control">
+    
+    <img src="/go-questions/svg/toc.svg" class="book-icon" alt="Table of Contents" />
+    
+  </label>
+</div>
+
+
+  
+  <aside class="hidden clearfix">
+    
+  
+<nav id="TableOfContents"></nav>
+
+
+
+  </aside>
+  
+ 
+      </header>
+
+      
+      
+  <article class="markdown"><p>上一讲说到调度器将 main goroutine 推上舞台，为它铺好了道路，开始执行 <code>runtime.main</code> 函数。这一讲，我们探索 main goroutine 以及普通 goroutine 从执行到退出的整个过程。</p>
+<div class="highlight"><div style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;">
+<table style="border-spacing:0;padding:0;margin:0;border:0;"><tr><td style="vertical-align:top;padding:0;margin:0;border:0;">
+<pre tabindex="0" style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;"><code><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 1
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 2
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 3
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 4
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 5
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 6
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 7
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 8
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 9
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">10
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">11
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">12
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">13
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">14
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">15
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">16
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">17
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">18
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">19
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">20
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">21
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">22
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">23
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">24
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">25
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">26
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">27
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">28
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">29
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">30
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">31
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">32
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">33
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">34
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">35
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">36
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">37
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">38
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">39
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">40
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">41
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">42
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">43
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">44
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">45
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">46
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">47
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">48
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">49
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">50
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">51
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">52
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">53
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">54
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">55
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">56
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">57
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">58
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">59
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">60
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">61
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">62
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">63
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">64
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">65
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">66
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">67
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">68
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">69
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">70
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">71
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">72
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">73
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">74
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">75
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">76
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">77
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">78
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">79
+</span></code></pre></td>
+<td style="vertical-align:top;padding:0;margin:0;border:0;;width:100%">
+<pre tabindex="0" style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;"><code class="language-golang" data-lang="golang"><span style="display:flex;"><span><span style="color:#008000">// The main goroutine.</span>
+</span></span><span style="display:flex;"><span><span style="color:#00f">func</span> main() {
+</span></span><span style="display:flex;"><span>    <span style="color:#008000">// g = main goroutine，不再是 g0 了</span>
+</span></span><span style="display:flex;"><span>    g := getg()
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>    <span style="color:#008000">// ……………………</span>
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>    <span style="color:#00f">if</span> sys.PtrSize == 8 {
+</span></span><span style="display:flex;"><span>        maxstacksize = 1000000000
+</span></span><span style="display:flex;"><span>    } <span style="color:#00f">else</span> {
+</span></span><span style="display:flex;"><span>        maxstacksize = 250000000
+</span></span><span style="display:flex;"><span>    }
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>    <span style="color:#008000">// Allow newproc to start new Ms.</span>
+</span></span><span style="display:flex;"><span>    mainStarted = <span style="color:#00f">true</span>
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>    systemstack(<span style="color:#00f">func</span>() {
+</span></span><span style="display:flex;"><span>        <span style="color:#008000">// 创建监控线程，该线程独立于调度器，不需要跟 p 关联即可运行</span>
+</span></span><span style="display:flex;"><span>        newm(sysmon, <span style="color:#00f">nil</span>)
+</span></span><span style="display:flex;"><span>    })
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>    lockOSThread()
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>    <span style="color:#00f">if</span> g.m != &amp;m0 {
+</span></span><span style="display:flex;"><span>        throw(<span style="color:#a31515">&#34;runtime.main not on m0&#34;</span>)
+</span></span><span style="display:flex;"><span>    }
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>    <span style="color:#008000">// 调用 runtime 包的初始化函数，由编译器实现</span>
+</span></span><span style="display:flex;"><span>    runtime_init() <span style="color:#008000">// must be before defer</span>
+</span></span><span style="display:flex;"><span>    <span style="color:#00f">if</span> nanotime() == 0 {
+</span></span><span style="display:flex;"><span>        throw(<span style="color:#a31515">&#34;nanotime returning zero&#34;</span>)
+</span></span><span style="display:flex;"><span>    }
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>    <span style="color:#008000">// Defer unlock so that runtime.Goexit during init does the unlock too.</span>
+</span></span><span style="display:flex;"><span>    needUnlock := <span style="color:#00f">true</span>
+</span></span><span style="display:flex;"><span>    <span style="color:#00f">defer</span> <span style="color:#00f">func</span>() {
+</span></span><span style="display:flex;"><span>        <span style="color:#00f">if</span> needUnlock {
+</span></span><span style="display:flex;"><span>            unlockOSThread()
+</span></span><span style="display:flex;"><span>        }
+</span></span><span style="display:flex;"><span>    }()
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>    <span style="color:#008000">// Record when the world started. Must be after runtime_init</span>
+</span></span><span style="display:flex;"><span>    <span style="color:#008000">// because nanotime on some platforms depends on startNano.</span>
+</span></span><span style="display:flex;"><span>    runtimeInitTime = nanotime()
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>    <span style="color:#008000">// 开启垃圾回收器</span>
+</span></span><span style="display:flex;"><span>    gcenable()
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>    main_init_done = make(<span style="color:#00f">chan</span> <span style="color:#2b91af">bool</span>)
+</span></span><span style="display:flex;"><span>    
+</span></span><span style="display:flex;"><span>    <span style="color:#008000">// ……………………</span>
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>    <span style="color:#008000">// main 包的初始化，递归的调用我们 import 进来的包的初始化函数</span>
+</span></span><span style="display:flex;"><span>    fn := main_init
+</span></span><span style="display:flex;"><span>    fn()
+</span></span><span style="display:flex;"><span>    close(main_init_done)
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>    needUnlock = <span style="color:#00f">false</span>
+</span></span><span style="display:flex;"><span>    unlockOSThread()
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>    <span style="color:#008000">// ……………………</span>
+</span></span><span style="display:flex;"><span>    
+</span></span><span style="display:flex;"><span>    <span style="color:#008000">// 调用 main.main 函数</span>
+</span></span><span style="display:flex;"><span>    fn = main_main
+</span></span><span style="display:flex;"><span>    fn()
+</span></span><span style="display:flex;"><span>    <span style="color:#00f">if</span> raceenabled {
+</span></span><span style="display:flex;"><span>        racefini()
+</span></span><span style="display:flex;"><span>    }
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>    <span style="color:#008000">// ……………………</span>
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>    <span style="color:#008000">// 进入系统调用，退出进程，可以看出 main goroutine 并未返回，而是直接进入系统调用退出进程了</span>
+</span></span><span style="display:flex;"><span>    exit(0)
+</span></span><span style="display:flex;"><span>    <span style="color:#008000">// 保护性代码，如果 exit 意外返回，下面的代码会让该进程 crash 死掉</span>
+</span></span><span style="display:flex;"><span>    <span style="color:#00f">for</span> {
+</span></span><span style="display:flex;"><span>        <span style="color:#00f">var</span> x *<span style="color:#2b91af">int32</span>
+</span></span><span style="display:flex;"><span>        *x = 0
+</span></span><span style="display:flex;"><span>    }
+</span></span><span style="display:flex;"><span>}
+</span></span></code></pre></td></tr></table>
+</div>
+</div><p><code>main</code> 函数执行流程如下图：</p>
+<p><img src="../assets/2.png" alt="runtime.main 启动流程" /></p>
+<p>从流程图可知，main goroutine 执行完之后就直接调用 <code>exit(0)</code> 退出了，这会导致整个进程退出，太粗暴了。</p>
+<p>不过，main goroutine 实际上就是代表用户的 main 函数，它都执行完了，肯定是用户的任务都执行完了，直接退出就可以了，就算有其他的 goroutine 没执行完，同样会直接退出。</p>
+<div class="highlight"><div style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;">
+<table style="border-spacing:0;padding:0;margin:0;border:0;"><tr><td style="vertical-align:top;padding:0;margin:0;border:0;">
+<pre tabindex="0" style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;"><code><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">1
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">2
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">3
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">4
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">5
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">6
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">7
+</span></code></pre></td>
+<td style="vertical-align:top;padding:0;margin:0;border:0;;width:100%">
+<pre tabindex="0" style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;"><code class="language-golang" data-lang="golang"><span style="display:flex;"><span><span style="color:#00f">package</span> main
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span><span style="color:#00f">import</span> <span style="color:#a31515">&#34;fmt&#34;</span>
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span><span style="color:#00f">func</span> main() {
+</span></span><span style="display:flex;"><span>	 <span style="color:#00f">go</span> <span style="color:#00f">func</span>() {fmt.Println(<span style="color:#a31515">&#34;hello qcrao.com&#34;</span>)}()
+</span></span><span style="display:flex;"><span>}
+</span></span></code></pre></td></tr></table>
+</div>
+</div><p>在这个例子中，main goroutine 退出时，还来不及执行 <code>go 出去</code> 的函数，整个进程就直接退出了，打印语句不会执行。因此，main goroutine 不会等待其他 goroutine 执行完再退出，知道这个有时能解释一些现象，比如上面那个例子。</p>
+<p>这时，心中可能会跳出疑问，我们在新创建 goroutine 的时候，不是整出了个“偷天换日”，风风火火地设置了 goroutine 退出时应该跳到 <code>runtime.goexit</code> 函数吗，怎么这会不用了，闲得慌？</p>
+<p>回顾一下上一讲的内容，跳转到 main 函数的两行代码：</p>
+<div class="highlight"><div style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;">
+<table style="border-spacing:0;padding:0;margin:0;border:0;"><tr><td style="vertical-align:top;padding:0;margin:0;border:0;">
+<pre tabindex="0" style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;"><code><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">1
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">2
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">3
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">4
+</span></code></pre></td>
+<td style="vertical-align:top;padding:0;margin:0;border:0;;width:100%">
+<pre tabindex="0" style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;"><code class="language-asm" data-lang="asm"><span style="display:flex;"><span><span style="color:#008000">// 把 sched.pc 值放入 BX 寄存器
+</span></span></span><span style="display:flex;"><span>MOVQ	gobuf_pc(BX), BX
+</span></span><span style="display:flex;"><span><span style="color:#008000">// JMP 把 BX 寄存器的包含的地址值放入 CPU 的 IP 寄存器，于是，CPU 跳转到该地址继续执行指令
+</span></span></span><span style="display:flex;"><span>JMP	BX
+</span></span></code></pre></td></tr></table>
+</div>
+</div><p>直接使用了一个跳转，并没有使用 <code>CALL</code> 指令，而 runtime.main 函数中确实也没有 <code>RET</code> 返回的指令。所以，main goroutine 执行完后，直接调用 exit(0) 退出整个进程。</p>
+<p>那之前整地“偷天换日”还有用吗？有的！这是针对非 main goroutine 起作用。</p>
+<p>参考资料【阿波张 非 goroutine 的退出】中用调试工具验证了非 main goroutine 的退出，感兴趣的可以去跟着实践一遍。</p>
+<p>我们继续探索非 main goroutine （后文我们就称 gp 好了）的退出流程。</p>
+<p><code>gp</code> 执行完后，RET 指令弹出 <code>goexit</code> 函数地址（实际上是 funcPC(goexit)+1），CPU 跳转到 <code>goexit</code> 的第二条指令继续执行：</p>
+<div class="highlight"><div style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;">
+<table style="border-spacing:0;padding:0;margin:0;border:0;"><tr><td style="vertical-align:top;padding:0;margin:0;border:0;">
+<pre tabindex="0" style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;"><code><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">1
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">2
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">3
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">4
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">5
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">6
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">7
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">8
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">9
+</span></code></pre></td>
+<td style="vertical-align:top;padding:0;margin:0;border:0;;width:100%">
+<pre tabindex="0" style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;"><code class="language-golang" data-lang="golang"><span style="display:flex;"><span><span style="color:#008000">// src/runtime/asm_amd64.s</span>
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span><span style="color:#008000">// The top-most function running on a goroutine</span>
+</span></span><span style="display:flex;"><span><span style="color:#008000">// returns to goexit+PCQuantum.</span>
+</span></span><span style="display:flex;"><span>TEXT runtime<span style="">·</span>goexit(SB),NOSPLIT,<span style="">$</span>0-0
+</span></span><span style="display:flex;"><span>	BYTE	<span style="">$</span>0x90	<span style="color:#008000">// NOP</span>
+</span></span><span style="display:flex;"><span>	CALL	runtime<span style="">·</span>goexit1(SB)	<span style="color:#008000">// does not return</span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// traceback from goexit1 must hit code range of goexit</span>
+</span></span><span style="display:flex;"><span>	BYTE	<span style="">$</span>0x90	<span style="color:#008000">// NOP</span>
+</span></span></code></pre></td></tr></table>
+</div>
+</div><p>直接调用 <code>runtime·goexit1</code>：</p>
+<div class="highlight"><div style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;">
+<table style="border-spacing:0;padding:0;margin:0;border:0;"><tr><td style="vertical-align:top;padding:0;margin:0;border:0;">
+<pre tabindex="0" style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;"><code><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">1
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">2
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">3
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">4
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">5
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">6
+</span></code></pre></td>
+<td style="vertical-align:top;padding:0;margin:0;border:0;;width:100%">
+<pre tabindex="0" style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;"><code class="language-golang" data-lang="golang"><span style="display:flex;"><span><span style="color:#008000">// src/runtime/proc.go</span>
+</span></span><span style="display:flex;"><span><span style="color:#008000">// Finishes execution of the current goroutine.</span>
+</span></span><span style="display:flex;"><span><span style="color:#00f">func</span> goexit1() {
+</span></span><span style="display:flex;"><span>    <span style="color:#008000">// …………………… </span>
+</span></span><span style="display:flex;"><span>	mcall(goexit0)
+</span></span><span style="display:flex;"><span>}
+</span></span></code></pre></td></tr></table>
+</div>
+</div><p>调用 <code>mcall</code> 函数：</p>
+<div class="highlight"><div style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;">
+<table style="border-spacing:0;padding:0;margin:0;border:0;"><tr><td style="vertical-align:top;padding:0;margin:0;border:0;">
+<pre tabindex="0" style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;"><code><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 1
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 2
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 3
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 4
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 5
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 6
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 7
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 8
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 9
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">10
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">11
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">12
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">13
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">14
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">15
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">16
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">17
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">18
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">19
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">20
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">21
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">22
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">23
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">24
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">25
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">26
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">27
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">28
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">29
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">30
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">31
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">32
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">33
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">34
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">35
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">36
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">37
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">38
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">39
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">40
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">41
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">42
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">43
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">44
+</span></code></pre></td>
+<td style="vertical-align:top;padding:0;margin:0;border:0;;width:100%">
+<pre tabindex="0" style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;"><code class="language-golang" data-lang="golang"><span style="display:flex;"><span><span style="color:#008000">// 切换到 g0 栈，执行 fn(g)</span>
+</span></span><span style="display:flex;"><span><span style="color:#008000">// Fn 不能返回</span>
+</span></span><span style="display:flex;"><span>TEXT runtime<span style="">·</span>mcall(SB), NOSPLIT, <span style="">$</span>0-8
+</span></span><span style="display:flex;"><span>    <span style="color:#008000">// 取出参数的值放入 DI 寄存器，它是 funcval 对象的指针，此场景中 fn.fn 是 goexit0 的地址</span>
+</span></span><span style="display:flex;"><span>    MOVQ    fn+0(FP), DI
+</span></span><span style="display:flex;"><span>    
+</span></span><span style="display:flex;"><span>    get_tls(CX)
+</span></span><span style="display:flex;"><span>    <span style="color:#008000">// AX = g</span>
+</span></span><span style="display:flex;"><span>    MOVQ    g(CX), AX   <span style="color:#008000">// save state in g-&gt;sched</span>
+</span></span><span style="display:flex;"><span>    <span style="color:#008000">// mcall 返回地址放入 BX</span>
+</span></span><span style="display:flex;"><span>    MOVQ    0(SP), BX   <span style="color:#008000">// caller&#39;s PC</span>
+</span></span><span style="display:flex;"><span>    <span style="color:#008000">// g.sched.pc = BX，保存 g 的 PC</span>
+</span></span><span style="display:flex;"><span>    MOVQ    BX, (g_sched+gobuf_pc)(AX)
+</span></span><span style="display:flex;"><span>    LEAQ    fn+0(FP), BX    <span style="color:#008000">// caller&#39;s SP</span>
+</span></span><span style="display:flex;"><span>    <span style="color:#008000">// 保存 g 的 SP</span>
+</span></span><span style="display:flex;"><span>    MOVQ    BX, (g_sched+gobuf_sp)(AX)
+</span></span><span style="display:flex;"><span>    MOVQ    AX, (g_sched+gobuf_g)(AX)
+</span></span><span style="display:flex;"><span>    MOVQ    BP, (g_sched+gobuf_bp)(AX)
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>    <span style="color:#008000">// switch to m-&gt;g0 &amp; its stack, call fn</span>
+</span></span><span style="display:flex;"><span>    MOVQ    g(CX), BX
+</span></span><span style="display:flex;"><span>    MOVQ    g_m(BX), BX
+</span></span><span style="display:flex;"><span>    <span style="color:#008000">// SI = g0</span>
+</span></span><span style="display:flex;"><span>    MOVQ    m_g0(BX), SI
+</span></span><span style="display:flex;"><span>    CMPQ    SI, AX  <span style="color:#008000">// if g == m-&gt;g0 call badmcall</span>
+</span></span><span style="display:flex;"><span>    JNE 3(PC)
+</span></span><span style="display:flex;"><span>    MOVQ    <span style="">$</span>runtime<span style="">·</span>badmcall(SB), AX
+</span></span><span style="display:flex;"><span>    JMP AX
+</span></span><span style="display:flex;"><span>    <span style="color:#008000">// 把 g0 的地址设置到线程本地存储中</span>
+</span></span><span style="display:flex;"><span>    MOVQ    SI, g(CX)   <span style="color:#008000">// g = m-&gt;g0</span>
+</span></span><span style="display:flex;"><span>    <span style="color:#008000">// 从 g 的栈切换到了 g0 的栈D</span>
+</span></span><span style="display:flex;"><span>    MOVQ    (g_sched+gobuf_sp)(SI), SP  <span style="color:#008000">// sp = m-&gt;g0-&gt;sched.sp</span>
+</span></span><span style="display:flex;"><span>    <span style="color:#008000">// AX = g，参数入栈</span>
+</span></span><span style="display:flex;"><span>    PUSHQ   AX
+</span></span><span style="display:flex;"><span>    MOVQ    DI, DX
+</span></span><span style="display:flex;"><span>    <span style="color:#008000">// DI 是结构体 funcval 实例对象的指针，它的第一个成员才是 goexit0 的地址</span>
+</span></span><span style="display:flex;"><span>    <span style="color:#008000">// 读取第一个成员到 DI 寄存器</span>
+</span></span><span style="display:flex;"><span>    MOVQ    0(DI), DI
+</span></span><span style="display:flex;"><span>    <span style="color:#008000">// 调用 goexit0(g)</span>
+</span></span><span style="display:flex;"><span>    CALL    DI
+</span></span><span style="display:flex;"><span>    POPQ    AX
+</span></span><span style="display:flex;"><span>    MOVQ    <span style="">$</span>runtime<span style="">·</span>badmcall2(SB), AX
+</span></span><span style="display:flex;"><span>    JMP AX
+</span></span><span style="display:flex;"><span>    RET
+</span></span></code></pre></td></tr></table>
+</div>
+</div><p>函数参数是：</p>
+<div class="highlight"><div style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;">
+<table style="border-spacing:0;padding:0;margin:0;border:0;"><tr><td style="vertical-align:top;padding:0;margin:0;border:0;">
+<pre tabindex="0" style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;"><code><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">1
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">2
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">3
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">4
+</span></code></pre></td>
+<td style="vertical-align:top;padding:0;margin:0;border:0;;width:100%">
+<pre tabindex="0" style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;"><code class="language-golang" data-lang="golang"><span style="display:flex;"><span><span style="color:#00f">type</span> funcval <span style="color:#00f">struct</span> {
+</span></span><span style="display:flex;"><span>	fn <span style="color:#2b91af">uintptr</span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// variable-size, fn-specific data here</span>
+</span></span><span style="display:flex;"><span>}
+</span></span></code></pre></td></tr></table>
+</div>
+</div><p>字段 fn 就表示 goexit0 函数的地址。</p>
+<p>L5 将函数参数保存到 DI 寄存器，这里 fn.fn 就是 goexit0 的地址。</p>
+<p>L7 将 tls 保存到 CX 寄存器，L9 将 当前线程指向的 goroutine （非 main goroutine，称为 gp）保存到 AX 寄存器，L11 将调用者（调用 mcall 函数）的栈顶，这里就是 mcall 完成后的返回地址，存入 BX 寄存器。</p>
+<p>L13 将 mcall 的返回地址保存到 gp 的 g.sched.pc 字段，L14 将 gp 的栈顶，也就是 SP 保存到 BX 寄存器，L16 将 SP 保存到 gp 的 g.sched.sp 字段，L17 将 g 保存到 gp 的 g.sched.g 字段，L18 将 BP 保存 到 gp 的 g.sched.bp 字段。这一段主要是保存 gp 的调度信息。</p>
+<p>L21 将当前指向的 g 保存到 BX 寄存器，L22 将 g.m 字段保存到 BX 寄存器，L23 将 g.m.g0 字段保存到 SI，g.m.g0 就是当前工作线程的 g0。</p>
+<p>现在，SI = g0， AX = gp，L25 判断 gp 是否是 g0，如果 gp == g0 说明有问题，执行 runtime·badmcall。正常情况下，PC 值加 3，跳过下面的两条指令，直接到达 L30。</p>
+<p>L30 将 g0 的地址设置到线程本地存储中，L32 将 g0.SP 设置到 CPU 的 SP 寄存器，这也就意味着我们从 gp 栈切换到了 g0 的栈，要变天了！</p>
+<p>L34 将参数 gp 入栈，为调用 goexit0 构造参数。L35 将 DI 寄存器的内容设置到 DX 寄存器，DI 是结构体 funcval 实例对象的指针，它的第一个成员才是 goexit0 的地址。L36 读取 DI 第一成员，也就是 goexit0 函数的地址。</p>
+<p>L40 调用 goexit0 函数，这已经是在 g0 栈上执行了，函数参数就是 gp。</p>
+<p>到这里，就会去执行 goexit0 函数，注意，这里永远都不会返回。所以，在 CALL 指令后面，如果返回了，又会去调用 <code>runtime.badmcall2</code> 函数去处理意外情况。</p>
+<p>来继续看 goexit0：</p>
+<div class="highlight"><div style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;">
+<table style="border-spacing:0;padding:0;margin:0;border:0;"><tr><td style="vertical-align:top;padding:0;margin:0;border:0;">
+<pre tabindex="0" style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;"><code><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 1
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 2
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 3
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 4
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 5
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 6
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 7
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 8
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 9
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">10
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">11
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">12
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">13
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">14
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">15
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">16
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">17
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">18
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">19
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">20
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">21
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">22
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">23
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">24
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">25
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">26
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">27
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">28
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">29
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">30
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">31
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">32
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">33
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">34
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">35
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">36
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">37
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">38
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">39
+</span></code></pre></td>
+<td style="vertical-align:top;padding:0;margin:0;border:0;;width:100%">
+<pre tabindex="0" style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;"><code class="language-golang" data-lang="golang"><span style="display:flex;"><span><span style="color:#008000">// goexit continuation on g0.</span>
+</span></span><span style="display:flex;"><span><span style="color:#008000">// 在 g0 上执行</span>
+</span></span><span style="display:flex;"><span><span style="color:#00f">func</span> goexit0(gp *g) {
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// g0</span>
+</span></span><span style="display:flex;"><span>	_g_ := getg()
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>	casgstatus(gp, _Grunning, _Gdead)
+</span></span><span style="display:flex;"><span>	<span style="color:#00f">if</span> isSystemGoroutine(gp) {
+</span></span><span style="display:flex;"><span>		atomic.Xadd(&amp;sched.ngsys, -1)
+</span></span><span style="display:flex;"><span>	}
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// 清空 gp 的一些字段</span>
+</span></span><span style="display:flex;"><span>	gp.m = <span style="color:#00f">nil</span>
+</span></span><span style="display:flex;"><span>	gp.lockedm = <span style="color:#00f">nil</span>
+</span></span><span style="display:flex;"><span>	_g_.m.lockedg = <span style="color:#00f">nil</span>
+</span></span><span style="display:flex;"><span>	gp.paniconfault = <span style="color:#00f">false</span>
+</span></span><span style="display:flex;"><span>	gp._defer = <span style="color:#00f">nil</span> <span style="color:#008000">// should be true already but just in case.</span>
+</span></span><span style="display:flex;"><span>	gp._panic = <span style="color:#00f">nil</span> <span style="color:#008000">// non-nil for Goexit during panic. points at stack-allocated data.</span>
+</span></span><span style="display:flex;"><span>	gp.writebuf = <span style="color:#00f">nil</span>
+</span></span><span style="display:flex;"><span>	gp.waitreason = <span style="color:#a31515">&#34;&#34;</span>
+</span></span><span style="display:flex;"><span>	gp.param = <span style="color:#00f">nil</span>
+</span></span><span style="display:flex;"><span>	gp.labels = <span style="color:#00f">nil</span>
+</span></span><span style="display:flex;"><span>	gp.timer = <span style="color:#00f">nil</span>
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// Note that gp&#39;s stack scan is now &#34;valid&#34; because it has no</span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// stack.</span>
+</span></span><span style="display:flex;"><span>	gp.gcscanvalid = <span style="color:#00f">true</span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// 解除 g 与 m 的关系</span>
+</span></span><span style="display:flex;"><span>	dropg()
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>	<span style="color:#00f">if</span> _g_.m.locked&amp;^_LockExternal != 0 {
+</span></span><span style="display:flex;"><span>		print(<span style="color:#a31515">&#34;invalid m-&gt;locked = &#34;</span>, _g_.m.locked, <span style="color:#a31515">&#34;\n&#34;</span>)
+</span></span><span style="display:flex;"><span>		throw(<span style="color:#a31515">&#34;internal lockOSThread error&#34;</span>)
+</span></span><span style="display:flex;"><span>	}
+</span></span><span style="display:flex;"><span>	_g_.m.locked = 0
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// 将 g 放入 free 队列缓存起来</span>
+</span></span><span style="display:flex;"><span>	gfput(_g_.m.p.ptr(), gp)
+</span></span><span style="display:flex;"><span>	schedule()
+</span></span><span style="display:flex;"><span>}
+</span></span></code></pre></td></tr></table>
+</div>
+</div><p>它主要完成最后的清理工作：</p>
+<blockquote>
+<ol>
+<li>把 g 的状态从 <code>_Grunning</code> 更新为 <code>_Gdead</code>；</li>
+</ol>
+</blockquote>
+<blockquote>
+<ol start="2">
+<li>清空 g 的一些字段；</li>
+</ol>
+</blockquote>
+<blockquote>
+<ol start="3">
+<li>调用 dropg 函数解除 g 和 m 之间的关系，其实就是设置 g-&gt;m = nil, m-&gt;currg = nil；</li>
+</ol>
+</blockquote>
+<blockquote>
+<ol start="4">
+<li>把 g 放入 p 的 freeg 队列缓存起来供下次创建 g 时快速获取而不用从内存分配。freeg 就是 g 的一个对象池；</li>
+</ol>
+</blockquote>
+<blockquote>
+<ol start="5">
+<li>调用 schedule 函数再次进行调度。</li>
+</ol>
+</blockquote>
+<p>到这里，gp 就完成了它的历史使命，功成身退，进入了 goroutine 缓存池，待下次有任务再重新启用。</p>
+<p>而工作线程，又继续调用 schedule 函数进行新一轮的调度，整个过程形成了一个循环。</p>
+<p>总结一下，main goroutine 和普通 goroutine 的退出过程：</p>
+<p>对于 main goroutine，在执行完用户定义的 main 函数的所有代码后，直接调用 exit(0) 退出整个进程，非常霸道。</p>
+<p>对于普通 goroutine 则没这么“舒服”，需要经历一系列的过程。先是跳转到提前设置好的 goexit 函数的第二条指令，然后调用 runtime.goexit1，接着调用 <code>mcall(goexit0)</code>，而 mcall 函数会切换到 g0 栈，运行 goexit0 函数，清理 goroutine 的一些字段，并将其添加到 goroutine 缓存池里，然后进入 schedule 调度循环。到这里，普通 goroutine 才算完成使命。</p>
+<h1 id="参考资料">
+  参考资料
+  <a class="anchor" href="#%e5%8f%82%e8%80%83%e8%b5%84%e6%96%99">#</a>
+</h1>
+<p>【阿波张 非 main goroutine 的退出及调度循环】https://mp.weixin.qq.com/s/XttP9q7-PO7VXhskaBzGqA</p>
+
+    
+  </article>
+ 
+      
+
+      <footer class="book-footer">
+        
+  <div class="flex flex-wrap justify-between">
+
+
+
+
+
+</div>
+
+ 
+        <div class="guide-links">
+
+
+</div>
+
+<div id="footer">
+<img alt="知识共享许可协议" style="border-width:0" src="https://licensebuttons.net/l/by-nc-nd/4.0/80x15.png">
+<p>Go宝典 由 <a href="https://qcrao.com">饶全成</a>, <a href="https://changkun.de">欧长坤</a>, 楚秦等
+采用<a rel="license" href="http://creativecommons.org/licenses/by-nc-nd/4.0/">署名-非商业性使用-禁止演绎 4.0 国际许可协议许可</a><br/>
+严禁任何商业行为使用或引用该文档的全部或部分内容，特授权 <a href="https://golang.design">golang.design/go-questions</a> 发布</p>
+</div>
+
+
+<script async src="https://www.googletagmanager.com/gtag/js?id=UA-80889616-4"></script>
+<script>
+window.dataLayer = window.dataLayer || [];
+function gtag(){dataLayer.push(arguments);}
+gtag('js', new Date());
+gtag('config', 'UA-80889616-4');
+</script>
+
+页面总访问量: <span id="urlstat-page-pv"></span>, 访问的用户数: <span id="urlstat-page-uv"></span>
+
+      </footer>
+
+      
+  
+  <div class="book-comments">
+
+</div>
+  
+ 
+
+      <label for="menu-control" class="hidden book-menu-overlay"></label>
+    </div>
+
+    
+    <aside class="book-toc">
+      <div class="book-toc-content">
+        
+  
+<nav id="TableOfContents"></nav>
+
+
+ 
+      </div>
+    </aside>
+    
+  </main>
+
+  
+</body>
+
+</html>
+
+
+
+
+
+
+
+
+
+
+
+

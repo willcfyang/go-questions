@@ -1,0 +1,2143 @@
+<!DOCTYPE html>
+<html lang="en" dir="ltr">
+
+<head>
+  <meta name="generator" content="Hugo 0.159.0">
+  <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="description" content="G、P、M 是 Go 调度器的三个核心组件，各司其职。在它们精密地配合下，Go 调度器得以高效运转，这也是 Go 天然支持高并发的内在动力。今天这篇文章我们来深入理解 GPM 模型。
+先看 G，取 goroutine 的首字母，主要保存 goroutine 的一些状态信息以及 CPU 的一些寄存器的值，例如 IP 寄存器，以便在轮到本 goroutine 执行时，CPU 知道要从哪一条指令处开始执行。
+
+当 goroutine 被调离 CPU 时，调度器负责把 CPU 寄存器的值保存在 g 对象的成员变量之中。
+
+
+当 goroutine 被调度起来运行时，调度器又负责把 g 对象的成员变量所保存的寄存器值恢复到 CPU 的寄存器。
+
+本系列使用的代码版本是 1.9.2，来看一下 g 的源码：
+
+
+ 1
+ 2
+ 3
+ 4
+ 5
+ 6
+ 7
+ 8
+ 9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+34
+35
+36
+37
+38
+39
+40
+41
+42
+43
+44
+45
+46
+47
+48
+49
+50
+51
+52
+53
+54
+55
+56
+57
+58
+59
+60
+61
+
+
+type g struct {
+
+	// goroutine 使用的栈
+	stack       stack   // offset known to runtime/cgo
+	// 用于栈的扩张和收缩检查，抢占标志
+	stackguard0 uintptr // offset known to liblink
+	stackguard1 uintptr // offset known to liblink
+
+	_panic         *_panic // innermost panic - offset known to liblink
+	_defer         *_defer // innermost defer
+	// 当前与 g 绑定的 m
+	m              *m      // current m; offset known to arm liblink
+	// goroutine 的运行现场
+	sched          gobuf
+	syscallsp      uintptr        // if status==Gsyscall, syscallsp = sched.sp to use during gc
+	syscallpc      uintptr        // if status==Gsyscall, syscallpc = sched.pc to use during gc
+	stktopsp       uintptr        // expected sp at top of stack, to check in traceback
+	// wakeup 时传入的参数
+	param          unsafe.Pointer // passed parameter on wakeup
+	atomicstatus   uint32
+	stackLock      uint32 // sigprof/scang lock; TODO: fold in to atomicstatus
+	goid           int64
+	// g 被阻塞之后的近似时间
+	waitsince      int64  // approx time when the g become blocked
+	// g 被阻塞的原因
+	waitreason     string // if status==Gwaiting
+	// 指向全局队列里下一个 g
+	schedlink      guintptr
+	// 抢占调度标志。这个为 true 时，stackguard0 等于 stackpreempt
+	preempt        bool     // preemption signal, duplicates stackguard0 = stackpreempt
+	paniconfault   bool     // panic (instead of crash) on unexpected fault address
+	preemptscan    bool     // preempted g does scan for gc
+	gcscandone     bool     // g has scanned stack; protected by _Gscan bit in status
+	gcscanvalid    bool     // false at start of gc cycle, true if G has not run since last scan; TODO: remove?
+	throwsplit     bool     // must not split stack
+	raceignore     int8     // ignore race detection events
+	sysblocktraced bool     // StartTrace has emitted EvGoInSyscall about this goroutine
+	// syscall 返回之后的 cputicks，用来做 tracing
+	sysexitticks   int64    // cputicks when syscall has returned (for tracing)
+	traceseq       uint64   // trace event sequencer
+	tracelastp     puintptr // last P emitted an event for this goroutine
+	// 如果调用了 LockOsThread，那么这个 g 会绑定到某个 m 上
+	lockedm        *m
+	sig            uint32
+	writebuf       []byte
+	sigcode0       uintptr
+	sigcode1       uintptr
+	sigpc          uintptr
+	// 创建该 goroutine 的语句的指令地址
+	gopc           uintptr // pc of go statement that created this goroutine
+	// goroutine 函数的指令地址
+	startpc        uintptr // pc of goroutine function
+	racectx        uintptr
+	waiting        *sudog         // sudog structures this g is waiting on (that have a valid elem ptr); in lock order
+	cgoCtxt        []uintptr      // cgo traceback context
+	labels         unsafe.Pointer // profiler labels
+	// time.Sleep 缓存的定时器
+	timer          *timer         // cached timer for time.Sleep
+
+	gcAssistBytes int64
+}
+
+
+源码中，比较重要的字段我已经作了注释，其他未作注释的与调度关系不大或者我暂时也没有理解的。">
+<meta name="theme-color" content="#FFFFFF"><meta property="og:url" content="http://golang.design/go-questions/sched/gpm/">
+  <meta property="og:site_name" content="Go宝典">
+  <meta property="og:title" content="GPM 是什么">
+  <meta property="og:description" content="G、P、M 是 Go 调度器的三个核心组件，各司其职。在它们精密地配合下，Go 调度器得以高效运转，这也是 Go 天然支持高并发的内在动力。今天这篇文章我们来深入理解 GPM 模型。
+先看 G，取 goroutine 的首字母，主要保存 goroutine 的一些状态信息以及 CPU 的一些寄存器的值，例如 IP 寄存器，以便在轮到本 goroutine 执行时，CPU 知道要从哪一条指令处开始执行。
+当 goroutine 被调离 CPU 时，调度器负责把 CPU 寄存器的值保存在 g 对象的成员变量之中。
+当 goroutine 被调度起来运行时，调度器又负责把 g 对象的成员变量所保存的寄存器值恢复到 CPU 的寄存器。
+本系列使用的代码版本是 1.9.2，来看一下 g 的源码：
+1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 type g struct { // goroutine 使用的栈 stack stack // offset known to runtime/cgo // 用于栈的扩张和收缩检查，抢占标志 stackguard0 uintptr // offset known to liblink stackguard1 uintptr // offset known to liblink _panic *_panic // innermost panic - offset known to liblink _defer *_defer // innermost defer // 当前与 g 绑定的 m m *m // current m; offset known to arm liblink // goroutine 的运行现场 sched gobuf syscallsp uintptr // if status==Gsyscall, syscallsp = sched.sp to use during gc syscallpc uintptr // if status==Gsyscall, syscallpc = sched.pc to use during gc stktopsp uintptr // expected sp at top of stack, to check in traceback // wakeup 时传入的参数 param unsafe.Pointer // passed parameter on wakeup atomicstatus uint32 stackLock uint32 // sigprof/scang lock; TODO: fold in to atomicstatus goid int64 // g 被阻塞之后的近似时间 waitsince int64 // approx time when the g become blocked // g 被阻塞的原因 waitreason string // if status==Gwaiting // 指向全局队列里下一个 g schedlink guintptr // 抢占调度标志。这个为 true 时，stackguard0 等于 stackpreempt preempt bool // preemption signal, duplicates stackguard0 = stackpreempt paniconfault bool // panic (instead of crash) on unexpected fault address preemptscan bool // preempted g does scan for gc gcscandone bool // g has scanned stack; protected by _Gscan bit in status gcscanvalid bool // false at start of gc cycle, true if G has not run since last scan; TODO: remove? throwsplit bool // must not split stack raceignore int8 // ignore race detection events sysblocktraced bool // StartTrace has emitted EvGoInSyscall about this goroutine // syscall 返回之后的 cputicks，用来做 tracing sysexitticks int64 // cputicks when syscall has returned (for tracing) traceseq uint64 // trace event sequencer tracelastp puintptr // last P emitted an event for this goroutine // 如果调用了 LockOsThread，那么这个 g 会绑定到某个 m 上 lockedm *m sig uint32 writebuf []byte sigcode0 uintptr sigcode1 uintptr sigpc uintptr // 创建该 goroutine 的语句的指令地址 gopc uintptr // pc of go statement that created this goroutine // goroutine 函数的指令地址 startpc uintptr // pc of goroutine function racectx uintptr waiting *sudog // sudog structures this g is waiting on (that have a valid elem ptr); in lock order cgoCtxt []uintptr // cgo traceback context labels unsafe.Pointer // profiler labels // time.Sleep 缓存的定时器 timer *timer // cached timer for time.Sleep gcAssistBytes int64 } 源码中，比较重要的字段我已经作了注释，其他未作注释的与调度关系不大或者我暂时也没有理解的。">
+  <meta property="og:locale" content="zh_CN">
+  <meta property="og:type" content="article">
+    <meta property="article:section" content="sched">
+<title>GPM 是什么 | Go宝典</title>
+<link rel="manifest" href="/go-questions/manifest.json">
+<link rel="icon" href="/go-questions/favicon.png" type="image/x-icon">
+<link rel="stylesheet" href="/go-questions/book.min.1026023dd873ce4c1427154fefa84d5022ba06f21fb7ebc0bc90c8c5295f58e3.css" integrity="sha256-ECYCPdhzzkwUJxVP76hNUCK6BvIft&#43;vAvJDIxSlfWOM=">
+<script defer src="/go-questions/en.search.min.a56febd3574db773904404c574762b15faf999f15aae7956d7234ead17a2768a.js" integrity="sha256-pW/r01dNt3OQRATFdHYrFfr5mfFarnlW1yNOrReidoo="></script>
+<!--
+Made with Book Theme
+https://github.com/alex-shpak/hugo-book
+-->
+
+
+
+  <script type="text/javascript" async
+src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.5/MathJax.js?config=TeX-MML-AM_CHTML">
+MathJax.Hub.Config({
+  tex2jax: {
+    inlineMath: [['$','$'], ['\\(','\\)']],
+    displayMath: [['$$','$$']],
+    processEscapes: true,
+    processEnvironments: true,
+    skipTags: ['script', 'noscript', 'style', 'textarea', 'pre'],
+    TeX: { equationNumbers: { autoNumber: "AMS" },
+         extensions: ["AMSmath.js", "AMSsymbols.js"] }
+  }
+  });
+  MathJax.Hub.Queue(function() {
+    
+    
+    
+    var all = MathJax.Hub.getAllJax(), i;
+    for(i = 0; i < all.length; i += 1) {
+        all[i].SourceElement().parentNode.className += ' has-jax';
+    }
+  });
+
+  MathJax.Hub.Config({
+  
+  TeX: { equationNumbers: { autoNumber: "AMS" } }
+  });
+</script>
+<script async src="//changkun.de/urlstat/client.js"></script>
+</head>
+
+<body dir="ltr">
+  <input type="checkbox" class="hidden toggle" id="menu-control" />
+  <input type="checkbox" class="hidden toggle" id="toc-control" />
+  <main class="container flex">
+    <aside class="book-menu">
+      <div class="book-menu-content">
+        
+  <nav>
+<h2 class="book-brand">
+  <a href="/go-questions"><span>Go宝典</span>
+  </a>
+</h2>
+
+
+<div class="book-search">
+  <input type="text" id="book-search-input" placeholder="" aria-label="" maxlength="64" data-hotkeys="s/" />
+  <div class="book-search-spinner hidden"></div>
+  <ul id="book-search-results"></ul>
+</div>
+
+
+
+<ul>
+    <li><a href="https://github.com/golang-design/Go-Questions">GitHub</a></li>
+</ul>
+<hr>
+
+
+
+
+
+
+
+  
+
+
+
+  
+  <ul>
+    
+      
+        <li class="book-section-flat" >
+          
+  
+  
+
+  
+    <input type="checkbox" id="section-a65dabd6eab2d958720d860b517524f2" class="toggle"  />
+    <label for="section-a65dabd6eab2d958720d860b517524f2" class="flex justify-between">
+      <a  class="">数组与切片</a>
+      <span>▾</span>
+    </label>
+  
+
+          
+  <ul>
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/slice/vs-array/" class="">数组与切片有什么异同</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/slice/grow/" class="">切片的容量是怎样增长的</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/slice/as-func-param/" class="">切片作为函数参数</a>
+  
+
+        </li>
+      
+    
+  </ul>
+
+        </li>
+      
+    
+      
+        <li class="book-section-flat" >
+          
+  
+  
+
+  
+    <input type="checkbox" id="section-40cb9c7d0ae8dd5d6dc59eea44d4f024" class="toggle"  />
+    <label for="section-40cb9c7d0ae8dd5d6dc59eea44d4f024" class="flex justify-between">
+      <a  class="">哈希表</a>
+      <span>▾</span>
+    </label>
+  
+
+          
+  <ul>
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/principal/" class="">map 的实现原理</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/get/" class="">如何实现两种 get 操作</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/range/" class="">遍历过程</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/assign/" class="">赋值过程</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/delete/" class="">删除过程</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/extend/" class="">扩容过程</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/unordered/" class="">key 为什么是无序的</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/float-as-key/" class="">float 类型可以作为 map 的 key 吗</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/delete-on-range/" class="">可以边遍历边删除吗</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/element-address/" class="">可以对 map 的元素取地址吗</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/compare/" class="">如何比较两个 map 相等</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/thread-safety/" class="">map 是线程安全的吗</a>
+  
+
+        </li>
+      
+    
+  </ul>
+
+        </li>
+      
+    
+      
+        <li class="book-section-flat" >
+          
+  
+  
+
+  
+    <input type="checkbox" id="section-eb16f3b57ba50e2a28f637e99054e45f" class="toggle"  />
+    <label for="section-eb16f3b57ba50e2a28f637e99054e45f" class="flex justify-between">
+      <a  class="">接口</a>
+      <span>▾</span>
+    </label>
+  
+
+          
+  <ul>
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/interface/duck-typing/" class="">Go 语言与鸭子类型的关系</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/interface/receiver/" class="">值接收者和指针接收者的区别</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/interface/iface-eface/" class="">iface 和 eface 的区别是什么</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/interface/dynamic-typing/" class="">接口的动态类型和动态值</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/interface/detect-impl/" class="">编译器自动检测类型是否实现接口</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/interface/construct/" class="">接口的构造过程是怎样的</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/interface/assert/" class="">类型转换和断言的区别</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/interface/convert/" class="">接口转换的原理</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/interface/polymorphism/" class="">如何用 interface 实现多态</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/interface/compare-to-cpp/" class="">Go 接口与 C&#43;&#43; 接口有何异同</a>
+  
+
+        </li>
+      
+    
+  </ul>
+
+        </li>
+      
+    
+      
+        <li class="book-section-flat" >
+          
+  
+  
+
+  
+    <input type="checkbox" id="section-c48fe4210547e2736252b7130a8fb35b" class="toggle"  />
+    <label for="section-c48fe4210547e2736252b7130a8fb35b" class="flex justify-between">
+      <a  class="">通道</a>
+      <span>▾</span>
+    </label>
+  
+
+          
+  <ul>
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/csp/" class="">什么是 CSP</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/struct/" class="">channel 底层的数据结构是什么</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/send/" class="">向 channel 发送数据的过程是怎样的</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/recv/" class="">从 channel 接收数据的过程是怎样的</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/close/" class="">关闭一个 channel 的过程是怎样的</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/read-on-close/" class="">从一个关闭的 channel 仍然能读出数据吗</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/ops/" class="">操作 channel 的情况总结</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/graceful-close/" class="">如何优雅地关闭 channel</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/principal/" class="">channel 发送和接收元素的本质是什么</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/leak/" class="">channel 在什么情况下会引起资源泄漏</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/happens-before/" class="">关于 channel 的 happened-before 有哪些</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/application/" class="">channel 有哪些应用</a>
+  
+
+        </li>
+      
+    
+  </ul>
+
+        </li>
+      
+    
+      
+        <li class="book-section-flat" >
+          
+  
+  
+
+  
+    <input type="checkbox" id="section-cf459139b27c2842a7aade68823220c5" class="toggle"  />
+    <label for="section-cf459139b27c2842a7aade68823220c5" class="flex justify-between">
+      <a  class="">标准库</a>
+      <span>▾</span>
+    </label>
+  
+
+          
+  <ul>
+    
+      
+        <li class="book-section-flat" >
+          
+  
+  
+
+  
+    <input type="checkbox" id="section-ec17239161d133f75c434cb014289362" class="toggle"  />
+    <label for="section-ec17239161d133f75c434cb014289362" class="flex justify-between">
+      <a  class="">context</a>
+      <span>▾</span>
+    </label>
+  
+
+          
+  <ul>
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/context/what/" class="">context 是什么</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/context/why/" class="">context 有什么作用</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/context/find-value/" class="">context.Value 的查找过程是怎样的</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/context/cancel/" class="">context 如何被取消</a>
+  
+
+        </li>
+      
+    
+  </ul>
+
+        </li>
+      
+    
+      
+        <li class="book-section-flat" >
+          
+  
+  
+
+  
+    <input type="checkbox" id="section-0bb1f278e21c7193888a989985c0b0ee" class="toggle"  />
+    <label for="section-0bb1f278e21c7193888a989985c0b0ee" class="flex justify-between">
+      <a  class="">reflect</a>
+      <span>▾</span>
+    </label>
+  
+
+          
+  <ul>
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/reflect/what/" class="">什么是反射</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/reflect/why/" class="">什么情况下需要使用反射</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/reflect/how/" class="">Go 语言如何实现反射</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/reflect/application/" class="">Go 语言中反射有哪些应用</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/reflect/compare/" class="">如何比较两个对象完全相同</a>
+  
+
+        </li>
+      
+    
+  </ul>
+
+        </li>
+      
+    
+      
+        <li class="book-section-flat" >
+          
+  
+  
+
+  
+    <input type="checkbox" id="section-26a1f92d5bf0434e0b92a598ca6e7fb9" class="toggle"  />
+    <label for="section-26a1f92d5bf0434e0b92a598ca6e7fb9" class="flex justify-between">
+      <a  class="">unsafe</a>
+      <span>▾</span>
+    </label>
+  
+
+          
+  <ul>
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/unsafe/pointers/" class="">Go指针和unsafe.Pointer有什么区别</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/unsafe/len/" class="">如何利用unsafe获取slice&amp;map的长度</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/unsafe/modify-private/" class="">如何利用unsafe包修改私有成员</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/unsafe/zero-conv/" class="">如何实现字符串和byte切片的零拷贝转换</a>
+  
+
+        </li>
+      
+    
+  </ul>
+
+        </li>
+      
+    
+  </ul>
+
+        </li>
+      
+    
+      
+        <li class="book-section-flat" >
+          
+  
+  
+
+  
+    <input type="checkbox" id="section-66bb7ef66e8598ada01c7f825054049f" class="toggle"  />
+    <label for="section-66bb7ef66e8598ada01c7f825054049f" class="flex justify-between">
+      <a  class="">编译</a>
+      <span>▾</span>
+    </label>
+  
+
+          
+  <ul>
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/compile/escape/" class="">逃逸分析是怎么进行的</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/compile/gopath/" class="">GoRoot 和 GoPath 有什么用</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/compile/link-process/" class="">Go 编译链接过程概述</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/compile/cmd/" class="">Go 编译相关的命令详解</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/compile/booting/" class="">Go 程序启动过程是怎样的</a>
+  
+
+        </li>
+      
+    
+  </ul>
+
+        </li>
+      
+    
+      
+        <li class="book-section-flat" >
+          
+  
+  
+
+  
+    <input type="checkbox" id="section-b8b0dd60ee3ee64dc6ccaf3bced28b29" class="toggle" checked />
+    <label for="section-b8b0dd60ee3ee64dc6ccaf3bced28b29" class="flex justify-between">
+      <a  class="">调度器</a>
+      <span>▾</span>
+    </label>
+  
+
+          
+  <ul>
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/goroutine-vs-thread/" class="">goroutine 和线程的区别</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/what-is/" class="">什么是 Go Scheduler</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/when/" class="">goroutine 调度时机有哪些</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/mn-model/" class="">什么是M:N模型</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/work-steal/" class="">什么是工作窃取</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/gpm/" class=" active">GPM 是什么</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/init/" class="">描述 scheduler 的初始化过程</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/main-goroutine/" class="">主 goroutine 如何创建</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/g0-stack/" class="">g0 栈何用户栈如何切换</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/sched-loop-boot/" class="">schedule 循环如何启动</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/goroutine-exit/" class="">goroutine 如何退出</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/sched-loop-exec/" class="">schedule 循环如何运转</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/m-worker/" class="">M 如何找工作</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/sysmon/" class="">sysmon 后台监控线程做了什么</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/sched-trap/" class="">一个调度相关的陷阱</a>
+  
+
+        </li>
+      
+    
+  </ul>
+
+        </li>
+      
+    
+      
+        <li class="book-section-flat" >
+          
+  
+  
+
+  
+    <input type="checkbox" id="section-49561050d01c571480cc1c3317ee29d7" class="toggle"  />
+    <label for="section-49561050d01c571480cc1c3317ee29d7" class="flex justify-between">
+      <a  class="">垃圾回收器</a>
+      <span>▾</span>
+    </label>
+  
+
+          
+  <ul>
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/memgc/principal/" class="">垃圾回收的认识</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/memgc/impl/" class="">垃圾回收机制的实现</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/memgc/optimize/" class="">垃圾回收的优化问题</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/memgc/history/" class="">历史及演进</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/memgc/summary/" class="">总结</a>
+  
+
+        </li>
+      
+    
+  </ul>
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/errata/" class="">勘误表</a>
+  
+
+        </li>
+      
+    
+  </ul>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<hr>
+<ul>
+<li style="font-style:italic">
+</li>
+</ul>
+版权所有 &copy; 2022 <a href="https://qcrao.com">饶全成</a>, <a href="https://changkun.de">欧长坤</a>, 楚秦等<br/><br/>
+
+The <a href="https://golang.design">golang.design</a> Initialtive
+</nav>
+
+
+
+
+  <script>(function(){var e=document.querySelector("aside.book-menu nav");addEventListener("beforeunload",function(){localStorage.setItem("menu.scrollTop",e.scrollTop)}),e.scrollTop=localStorage.getItem("menu.scrollTop")})()</script>
+
+
+ 
+      </div>
+    </aside>
+
+    <div class="book-page">
+      <header class="book-header">
+        
+  <div class="flex align-center justify-between">
+  <label for="menu-control">
+    <img src="/go-questions/svg/menu.svg" class="book-icon" alt="Menu" />
+  </label>
+
+  <strong>GPM 是什么</strong>
+
+  <label for="toc-control">
+    
+    <img src="/go-questions/svg/toc.svg" class="book-icon" alt="Table of Contents" />
+    
+  </label>
+</div>
+
+
+  
+  <aside class="hidden clearfix">
+    
+  
+<nav id="TableOfContents"></nav>
+
+
+
+  </aside>
+  
+ 
+      </header>
+
+      
+      
+  <article class="markdown"><p>G、P、M 是 Go 调度器的三个核心组件，各司其职。在它们精密地配合下，Go 调度器得以高效运转，这也是 Go 天然支持高并发的内在动力。今天这篇文章我们来深入理解 GPM 模型。</p>
+<p>先看 G，取 goroutine 的首字母，主要保存 goroutine 的一些状态信息以及 CPU 的一些寄存器的值，例如 IP 寄存器，以便在轮到本 goroutine 执行时，CPU 知道要从哪一条指令处开始执行。</p>
+<blockquote>
+<p>当 goroutine 被调离 CPU 时，调度器负责把 CPU 寄存器的值保存在 g 对象的成员变量之中。</p>
+</blockquote>
+<blockquote>
+<p>当 goroutine 被调度起来运行时，调度器又负责把 g 对象的成员变量所保存的寄存器值恢复到 CPU 的寄存器。</p>
+</blockquote>
+<p>本系列使用的代码版本是 1.9.2，来看一下 g 的源码：</p>
+<div class="highlight"><div style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;">
+<table style="border-spacing:0;padding:0;margin:0;border:0;"><tr><td style="vertical-align:top;padding:0;margin:0;border:0;">
+<pre tabindex="0" style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;"><code><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 1
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 2
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 3
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 4
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 5
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 6
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 7
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 8
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 9
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">10
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">11
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">12
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">13
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">14
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">15
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">16
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">17
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">18
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">19
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">20
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">21
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">22
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">23
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">24
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">25
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">26
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">27
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">28
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">29
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">30
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">31
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">32
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">33
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">34
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">35
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">36
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">37
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">38
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">39
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">40
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">41
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">42
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">43
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">44
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">45
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">46
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">47
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">48
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">49
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">50
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">51
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">52
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">53
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">54
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">55
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">56
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">57
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">58
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">59
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">60
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">61
+</span></code></pre></td>
+<td style="vertical-align:top;padding:0;margin:0;border:0;;width:100%">
+<pre tabindex="0" style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;"><code class="language-golang" data-lang="golang"><span style="display:flex;"><span><span style="color:#00f">type</span> g <span style="color:#00f">struct</span> {
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// goroutine 使用的栈</span>
+</span></span><span style="display:flex;"><span>	stack       stack   <span style="color:#008000">// offset known to runtime/cgo</span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// 用于栈的扩张和收缩检查，抢占标志</span>
+</span></span><span style="display:flex;"><span>	stackguard0 <span style="color:#2b91af">uintptr</span> <span style="color:#008000">// offset known to liblink</span>
+</span></span><span style="display:flex;"><span>	stackguard1 <span style="color:#2b91af">uintptr</span> <span style="color:#008000">// offset known to liblink</span>
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>	_panic         *_panic <span style="color:#008000">// innermost panic - offset known to liblink</span>
+</span></span><span style="display:flex;"><span>	_defer         *_defer <span style="color:#008000">// innermost defer</span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// 当前与 g 绑定的 m</span>
+</span></span><span style="display:flex;"><span>	m              *m      <span style="color:#008000">// current m; offset known to arm liblink</span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// goroutine 的运行现场</span>
+</span></span><span style="display:flex;"><span>	sched          gobuf
+</span></span><span style="display:flex;"><span>	syscallsp      <span style="color:#2b91af">uintptr</span>        <span style="color:#008000">// if status==Gsyscall, syscallsp = sched.sp to use during gc</span>
+</span></span><span style="display:flex;"><span>	syscallpc      <span style="color:#2b91af">uintptr</span>        <span style="color:#008000">// if status==Gsyscall, syscallpc = sched.pc to use during gc</span>
+</span></span><span style="display:flex;"><span>	stktopsp       <span style="color:#2b91af">uintptr</span>        <span style="color:#008000">// expected sp at top of stack, to check in traceback</span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// wakeup 时传入的参数</span>
+</span></span><span style="display:flex;"><span>	param          unsafe.Pointer <span style="color:#008000">// passed parameter on wakeup</span>
+</span></span><span style="display:flex;"><span>	atomicstatus   <span style="color:#2b91af">uint32</span>
+</span></span><span style="display:flex;"><span>	stackLock      <span style="color:#2b91af">uint32</span> <span style="color:#008000">// sigprof/scang lock; TODO: fold in to atomicstatus</span>
+</span></span><span style="display:flex;"><span>	goid           <span style="color:#2b91af">int64</span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// g 被阻塞之后的近似时间</span>
+</span></span><span style="display:flex;"><span>	waitsince      <span style="color:#2b91af">int64</span>  <span style="color:#008000">// approx time when the g become blocked</span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// g 被阻塞的原因</span>
+</span></span><span style="display:flex;"><span>	waitreason     <span style="color:#2b91af">string</span> <span style="color:#008000">// if status==Gwaiting</span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// 指向全局队列里下一个 g</span>
+</span></span><span style="display:flex;"><span>	schedlink      guintptr
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// 抢占调度标志。这个为 true 时，stackguard0 等于 stackpreempt</span>
+</span></span><span style="display:flex;"><span>	preempt        <span style="color:#2b91af">bool</span>     <span style="color:#008000">// preemption signal, duplicates stackguard0 = stackpreempt</span>
+</span></span><span style="display:flex;"><span>	paniconfault   <span style="color:#2b91af">bool</span>     <span style="color:#008000">// panic (instead of crash) on unexpected fault address</span>
+</span></span><span style="display:flex;"><span>	preemptscan    <span style="color:#2b91af">bool</span>     <span style="color:#008000">// preempted g does scan for gc</span>
+</span></span><span style="display:flex;"><span>	gcscandone     <span style="color:#2b91af">bool</span>     <span style="color:#008000">// g has scanned stack; protected by _Gscan bit in status</span>
+</span></span><span style="display:flex;"><span>	gcscanvalid    <span style="color:#2b91af">bool</span>     <span style="color:#008000">// false at start of gc cycle, true if G has not run since last scan; TODO: remove?</span>
+</span></span><span style="display:flex;"><span>	throwsplit     <span style="color:#2b91af">bool</span>     <span style="color:#008000">// must not split stack</span>
+</span></span><span style="display:flex;"><span>	raceignore     <span style="color:#2b91af">int8</span>     <span style="color:#008000">// ignore race detection events</span>
+</span></span><span style="display:flex;"><span>	sysblocktraced <span style="color:#2b91af">bool</span>     <span style="color:#008000">// StartTrace has emitted EvGoInSyscall about this goroutine</span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// syscall 返回之后的 cputicks，用来做 tracing</span>
+</span></span><span style="display:flex;"><span>	sysexitticks   <span style="color:#2b91af">int64</span>    <span style="color:#008000">// cputicks when syscall has returned (for tracing)</span>
+</span></span><span style="display:flex;"><span>	traceseq       <span style="color:#2b91af">uint64</span>   <span style="color:#008000">// trace event sequencer</span>
+</span></span><span style="display:flex;"><span>	tracelastp     puintptr <span style="color:#008000">// last P emitted an event for this goroutine</span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// 如果调用了 LockOsThread，那么这个 g 会绑定到某个 m 上</span>
+</span></span><span style="display:flex;"><span>	lockedm        *m
+</span></span><span style="display:flex;"><span>	sig            <span style="color:#2b91af">uint32</span>
+</span></span><span style="display:flex;"><span>	writebuf       []<span style="color:#2b91af">byte</span>
+</span></span><span style="display:flex;"><span>	sigcode0       <span style="color:#2b91af">uintptr</span>
+</span></span><span style="display:flex;"><span>	sigcode1       <span style="color:#2b91af">uintptr</span>
+</span></span><span style="display:flex;"><span>	sigpc          <span style="color:#2b91af">uintptr</span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// 创建该 goroutine 的语句的指令地址</span>
+</span></span><span style="display:flex;"><span>	gopc           <span style="color:#2b91af">uintptr</span> <span style="color:#008000">// pc of go statement that created this goroutine</span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// goroutine 函数的指令地址</span>
+</span></span><span style="display:flex;"><span>	startpc        <span style="color:#2b91af">uintptr</span> <span style="color:#008000">// pc of goroutine function</span>
+</span></span><span style="display:flex;"><span>	racectx        <span style="color:#2b91af">uintptr</span>
+</span></span><span style="display:flex;"><span>	waiting        *sudog         <span style="color:#008000">// sudog structures this g is waiting on (that have a valid elem ptr); in lock order</span>
+</span></span><span style="display:flex;"><span>	cgoCtxt        []<span style="color:#2b91af">uintptr</span>      <span style="color:#008000">// cgo traceback context</span>
+</span></span><span style="display:flex;"><span>	labels         unsafe.Pointer <span style="color:#008000">// profiler labels</span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// time.Sleep 缓存的定时器</span>
+</span></span><span style="display:flex;"><span>	timer          *timer         <span style="color:#008000">// cached timer for time.Sleep</span>
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>	gcAssistBytes <span style="color:#2b91af">int64</span>
+</span></span><span style="display:flex;"><span>}
+</span></span></code></pre></td></tr></table>
+</div>
+</div><p>源码中，比较重要的字段我已经作了注释，其他未作注释的与调度关系不大或者我暂时也没有理解的。</p>
+<p><code>g</code> 结构体关联了两个比较简单的结构体，stack 表示 goroutine 运行时的栈：</p>
+<div class="highlight"><div style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;">
+<table style="border-spacing:0;padding:0;margin:0;border:0;"><tr><td style="vertical-align:top;padding:0;margin:0;border:0;">
+<pre tabindex="0" style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;"><code><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">1
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">2
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">3
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">4
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">5
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">6
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">7
+</span></code></pre></td>
+<td style="vertical-align:top;padding:0;margin:0;border:0;;width:100%">
+<pre tabindex="0" style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;"><code class="language-golang" data-lang="golang"><span style="display:flex;"><span><span style="color:#008000">// 描述栈的数据结构，栈的范围：[lo, hi)</span>
+</span></span><span style="display:flex;"><span><span style="color:#00f">type</span> stack <span style="color:#00f">struct</span> {
+</span></span><span style="display:flex;"><span>    <span style="color:#008000">// 栈顶，低地址</span>
+</span></span><span style="display:flex;"><span>	lo <span style="color:#2b91af">uintptr</span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// 栈低，高地址</span>
+</span></span><span style="display:flex;"><span>	hi <span style="color:#2b91af">uintptr</span>
+</span></span><span style="display:flex;"><span>}
+</span></span></code></pre></td></tr></table>
+</div>
+</div><p>Goroutine 运行时，光有栈还不行，至少还得包括 PC，SP 等寄存器，gobuf 就保存了这些值：</p>
+<div class="highlight"><div style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;">
+<table style="border-spacing:0;padding:0;margin:0;border:0;"><tr><td style="vertical-align:top;padding:0;margin:0;border:0;">
+<pre tabindex="0" style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;"><code><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 1
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 2
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 3
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 4
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 5
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 6
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 7
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 8
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 9
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">10
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">11
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">12
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">13
+</span></code></pre></td>
+<td style="vertical-align:top;padding:0;margin:0;border:0;;width:100%">
+<pre tabindex="0" style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;"><code class="language-golang" data-lang="golang"><span style="display:flex;"><span><span style="color:#00f">type</span> gobuf <span style="color:#00f">struct</span> {
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// 存储 rsp 寄存器的值</span>
+</span></span><span style="display:flex;"><span>	sp   <span style="color:#2b91af">uintptr</span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// 存储 rip 寄存器的值</span>
+</span></span><span style="display:flex;"><span>	pc   <span style="color:#2b91af">uintptr</span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// 指向 goroutine</span>
+</span></span><span style="display:flex;"><span>	g    guintptr
+</span></span><span style="display:flex;"><span>	ctxt unsafe.Pointer <span style="color:#008000">// this has to be a pointer so that gc scans it</span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// 保存系统调用的返回值</span>
+</span></span><span style="display:flex;"><span>	ret  sys.Uintreg
+</span></span><span style="display:flex;"><span>	lr   <span style="color:#2b91af">uintptr</span>
+</span></span><span style="display:flex;"><span>	bp   <span style="color:#2b91af">uintptr</span> <span style="color:#008000">// for GOEXPERIMENT=framepointer</span>
+</span></span><span style="display:flex;"><span>}
+</span></span></code></pre></td></tr></table>
+</div>
+</div><p>再来看 M，取 machine 的首字母，它代表一个工作线程，或者说系统线程。G 需要调度到 M 上才能运行，M 是真正工作的人。结构体 m 就是我们常说的 M，它保存了 M 自身使用的栈信息、当前正在 M 上执行的 G 信息、与之绑定的 P 信息……</p>
+<p>当 M 没有工作可做的时候，在它休眠前，会“自旋”地来找工作：检查全局队列，查看 network poller，试图执行 gc 任务，或者“偷”工作。</p>
+<p>结构体 m 的源码如下：</p>
+<div class="highlight"><div style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;">
+<table style="border-spacing:0;padding:0;margin:0;border:0;"><tr><td style="vertical-align:top;padding:0;margin:0;border:0;">
+<pre tabindex="0" style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;"><code><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 1
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 2
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 3
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 4
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 5
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 6
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 7
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 8
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 9
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">10
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">11
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">12
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">13
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">14
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">15
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">16
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">17
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">18
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">19
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">20
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">21
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">22
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">23
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">24
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">25
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">26
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">27
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">28
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">29
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">30
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">31
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">32
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">33
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">34
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">35
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">36
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">37
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">38
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">39
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">40
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">41
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">42
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">43
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">44
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">45
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">46
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">47
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">48
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">49
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">50
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">51
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">52
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">53
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">54
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">55
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">56
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">57
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">58
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">59
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">60
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">61
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">62
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">63
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">64
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">65
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">66
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">67
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">68
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">69
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">70
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">71
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">72
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">73
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">74
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">75
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">76
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">77
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">78
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">79
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">80
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">81
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">82
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">83
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">84
+</span></code></pre></td>
+<td style="vertical-align:top;padding:0;margin:0;border:0;;width:100%">
+<pre tabindex="0" style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;"><code class="language-golang" data-lang="golang"><span style="display:flex;"><span><span style="color:#008000">// m 代表工作线程，保存了自身使用的栈信息</span>
+</span></span><span style="display:flex;"><span><span style="color:#00f">type</span> m <span style="color:#00f">struct</span> {
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// 记录工作线程（也就是内核线程）使用的栈信息。在执行调度代码时需要使用</span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// 执行用户 goroutine 代码时，使用用户 goroutine 自己的栈，因此调度时会发生栈的切换</span>
+</span></span><span style="display:flex;"><span>	g0      *g     <span style="color:#008000">// goroutine with scheduling stack/</span>
+</span></span><span style="display:flex;"><span>	morebuf gobuf  <span style="color:#008000">// gobuf arg to morestack</span>
+</span></span><span style="display:flex;"><span>	divmod  <span style="color:#2b91af">uint32</span> <span style="color:#008000">// div/mod denominator for arm - known to liblink</span>
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// Fields not known to debuggers.</span>
+</span></span><span style="display:flex;"><span>	procid        <span style="color:#2b91af">uint64</span>     <span style="color:#008000">// for debuggers, but offset not hard-coded</span>
+</span></span><span style="display:flex;"><span>	gsignal       *g         <span style="color:#008000">// signal-handling g</span>
+</span></span><span style="display:flex;"><span>	sigmask       sigset     <span style="color:#008000">// storage for saved signal mask</span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// 通过 tls 结构体实现 m 与工作线程的绑定</span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// 这里是线程本地存储</span>
+</span></span><span style="display:flex;"><span>	tls           [6]<span style="color:#2b91af">uintptr</span> <span style="color:#008000">// thread-local storage (for x86 extern register)</span>
+</span></span><span style="display:flex;"><span>	mstartfn      <span style="color:#00f">func</span>()
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// 指向正在运行的 goroutine 对象</span>
+</span></span><span style="display:flex;"><span>	curg          *g       <span style="color:#008000">// current running goroutine</span>
+</span></span><span style="display:flex;"><span>	caughtsig     guintptr <span style="color:#008000">// goroutine running during fatal signal</span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// 当前工作线程绑定的 p</span>
+</span></span><span style="display:flex;"><span>	p             puintptr <span style="color:#008000">// attached p for executing go code (nil if not executing go code)</span>
+</span></span><span style="display:flex;"><span>	nextp         puintptr
+</span></span><span style="display:flex;"><span>	id            <span style="color:#2b91af">int32</span>
+</span></span><span style="display:flex;"><span>	mallocing     <span style="color:#2b91af">int32</span>
+</span></span><span style="display:flex;"><span>	throwing      <span style="color:#2b91af">int32</span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// 该字段不等于空字符串的话，要保持 curg 始终在这个 m 上运行</span>
+</span></span><span style="display:flex;"><span>	preemptoff    <span style="color:#2b91af">string</span> <span style="color:#008000">// if != &#34;&#34;, keep curg running on this m</span>
+</span></span><span style="display:flex;"><span>	locks         <span style="color:#2b91af">int32</span>
+</span></span><span style="display:flex;"><span>	softfloat     <span style="color:#2b91af">int32</span>
+</span></span><span style="display:flex;"><span>	dying         <span style="color:#2b91af">int32</span>
+</span></span><span style="display:flex;"><span>	profilehz     <span style="color:#2b91af">int32</span>
+</span></span><span style="display:flex;"><span>	helpgc        <span style="color:#2b91af">int32</span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// 为 true 时表示当前 m 处于自旋状态，正在从其他线程偷工作</span>
+</span></span><span style="display:flex;"><span>	spinning      <span style="color:#2b91af">bool</span> <span style="color:#008000">// m is out of work and is actively looking for work</span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// m 正阻塞在 note 上</span>
+</span></span><span style="display:flex;"><span>	blocked       <span style="color:#2b91af">bool</span> <span style="color:#008000">// m is blocked on a note</span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// m 正在执行 write barrier</span>
+</span></span><span style="display:flex;"><span>	inwb          <span style="color:#2b91af">bool</span> <span style="color:#008000">// m is executing a write barrier</span>
+</span></span><span style="display:flex;"><span>	newSigstack   <span style="color:#2b91af">bool</span> <span style="color:#008000">// minit on C thread called sigaltstack</span>
+</span></span><span style="display:flex;"><span>	printlock     <span style="color:#2b91af">int8</span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// 正在执行 cgo 调用</span>
+</span></span><span style="display:flex;"><span>	incgo         <span style="color:#2b91af">bool</span> <span style="color:#008000">// m is executing a cgo call</span>
+</span></span><span style="display:flex;"><span>	fastrand      <span style="color:#2b91af">uint32</span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// cgo 调用总计数</span>
+</span></span><span style="display:flex;"><span>	ncgocall      <span style="color:#2b91af">uint64</span>      <span style="color:#008000">// number of cgo calls in total</span>
+</span></span><span style="display:flex;"><span>	ncgo          <span style="color:#2b91af">int32</span>       <span style="color:#008000">// number of cgo calls currently in progress</span>
+</span></span><span style="display:flex;"><span>	cgoCallersUse <span style="color:#2b91af">uint32</span>      <span style="color:#008000">// if non-zero, cgoCallers in use temporarily</span>
+</span></span><span style="display:flex;"><span>	cgoCallers    *cgoCallers <span style="color:#008000">// cgo traceback if crashing in cgo call</span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// 没有 goroutine 需要运行时，工作线程睡眠在这个 park 成员上，</span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// 其它线程通过这个 park 唤醒该工作线程</span>
+</span></span><span style="display:flex;"><span>	park          note
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// 记录所有工作线程的链表</span>
+</span></span><span style="display:flex;"><span>	alllink       *m <span style="color:#008000">// on allm</span>
+</span></span><span style="display:flex;"><span>	schedlink     muintptr
+</span></span><span style="display:flex;"><span>	mcache        *mcache
+</span></span><span style="display:flex;"><span>	lockedg       *g
+</span></span><span style="display:flex;"><span>	createstack   [32]<span style="color:#2b91af">uintptr</span> <span style="color:#008000">// stack that created this thread.</span>
+</span></span><span style="display:flex;"><span>	freglo        [16]<span style="color:#2b91af">uint32</span>  <span style="color:#008000">// d[i] lsb and f[i]</span>
+</span></span><span style="display:flex;"><span>	freghi        [16]<span style="color:#2b91af">uint32</span>  <span style="color:#008000">// d[i] msb and f[i+16]</span>
+</span></span><span style="display:flex;"><span>	fflag         <span style="color:#2b91af">uint32</span>      <span style="color:#008000">// floating point compare flags</span>
+</span></span><span style="display:flex;"><span>	locked        <span style="color:#2b91af">uint32</span>      <span style="color:#008000">// tracking for lockosthread</span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// 正在等待锁的下一个 m</span>
+</span></span><span style="display:flex;"><span>	nextwaitm     <span style="color:#2b91af">uintptr</span>     <span style="color:#008000">// next m waiting for lock</span>
+</span></span><span style="display:flex;"><span>	needextram    <span style="color:#2b91af">bool</span>
+</span></span><span style="display:flex;"><span>	traceback     <span style="color:#2b91af">uint8</span>
+</span></span><span style="display:flex;"><span>	waitunlockf   unsafe.Pointer <span style="color:#008000">// todo go func(*g, unsafe.pointer) bool</span>
+</span></span><span style="display:flex;"><span>	waitlock      unsafe.Pointer
+</span></span><span style="display:flex;"><span>	waittraceev   <span style="color:#2b91af">byte</span>
+</span></span><span style="display:flex;"><span>	waittraceskip <span style="color:#2b91af">int</span>
+</span></span><span style="display:flex;"><span>	startingtrace <span style="color:#2b91af">bool</span>
+</span></span><span style="display:flex;"><span>	syscalltick   <span style="color:#2b91af">uint32</span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// 工作线程 id</span>
+</span></span><span style="display:flex;"><span>	thread        <span style="color:#2b91af">uintptr</span> <span style="color:#008000">// thread handle</span>
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// these are here because they are too large to be on the stack</span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// of low-level NOSPLIT functions.</span>
+</span></span><span style="display:flex;"><span>	libcall   libcall
+</span></span><span style="display:flex;"><span>	libcallpc <span style="color:#2b91af">uintptr</span> <span style="color:#008000">// for cpu profiler</span>
+</span></span><span style="display:flex;"><span>	libcallsp <span style="color:#2b91af">uintptr</span>
+</span></span><span style="display:flex;"><span>	libcallg  guintptr
+</span></span><span style="display:flex;"><span>	syscall   libcall <span style="color:#008000">// stores syscall parameters on windows</span>
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>	mOS
+</span></span><span style="display:flex;"><span>}
+</span></span></code></pre></td></tr></table>
+</div>
+</div><p>再来看 P，取 processor 的首字母，为 M 的执行提供“上下文”，保存 M 执行 G 时的一些资源，例如本地可运行 G 队列，memeory cache 等。</p>
+<p>一个 M 只有绑定 P 才能执行 goroutine，当 M 被阻塞时，整个 P 会被传递给其他 M ，或者说整个 P 被接管。</p>
+<div class="highlight"><div style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;">
+<table style="border-spacing:0;padding:0;margin:0;border:0;"><tr><td style="vertical-align:top;padding:0;margin:0;border:0;">
+<pre tabindex="0" style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;"><code><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 1
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 2
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 3
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 4
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 5
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 6
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 7
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 8
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 9
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">10
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">11
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">12
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">13
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">14
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">15
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">16
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">17
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">18
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">19
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">20
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">21
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">22
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">23
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">24
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">25
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">26
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">27
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">28
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">29
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">30
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">31
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">32
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">33
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">34
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">35
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">36
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">37
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">38
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">39
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">40
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">41
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">42
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">43
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">44
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">45
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">46
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">47
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">48
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">49
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">50
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">51
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">52
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">53
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">54
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">55
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">56
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">57
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">58
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">59
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">60
+</span></code></pre></td>
+<td style="vertical-align:top;padding:0;margin:0;border:0;;width:100%">
+<pre tabindex="0" style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;"><code class="language-golang" data-lang="golang"><span style="display:flex;"><span><span style="color:#008000">// p 保存 go 运行时所必须的资源</span>
+</span></span><span style="display:flex;"><span><span style="color:#00f">type</span> p <span style="color:#00f">struct</span> {
+</span></span><span style="display:flex;"><span>	lock mutex
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// 在 allp 中的索引</span>
+</span></span><span style="display:flex;"><span>	id          <span style="color:#2b91af">int32</span>
+</span></span><span style="display:flex;"><span>	status      <span style="color:#2b91af">uint32</span> <span style="color:#008000">// one of pidle/prunning/...</span>
+</span></span><span style="display:flex;"><span>	link        puintptr
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// 每次调用 schedule 时会加一</span>
+</span></span><span style="display:flex;"><span>	schedtick   <span style="color:#2b91af">uint32</span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// 每次系统调用时加一</span>
+</span></span><span style="display:flex;"><span>	syscalltick <span style="color:#2b91af">uint32</span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// 用于 sysmon 线程记录被监控 p 的系统调用时间和运行时间</span>
+</span></span><span style="display:flex;"><span>	sysmontick  sysmontick <span style="color:#008000">// last tick observed by sysmon</span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// 指向绑定的 m，如果 p 是 idle 的话，那这个指针是 nil</span>
+</span></span><span style="display:flex;"><span>	m           muintptr   <span style="color:#008000">// back-link to associated m (nil if idle)</span>
+</span></span><span style="display:flex;"><span>	mcache      *mcache
+</span></span><span style="display:flex;"><span>	racectx     <span style="color:#2b91af">uintptr</span>
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>	deferpool    [5][]*_defer <span style="color:#008000">// pool of available defer structs of different sizes (see panic.go)</span>
+</span></span><span style="display:flex;"><span>	deferpoolbuf [5][32]*_defer
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// Cache of goroutine ids, amortizes accesses to runtime·sched.goidgen.</span>
+</span></span><span style="display:flex;"><span>	goidcache    <span style="color:#2b91af">uint64</span>
+</span></span><span style="display:flex;"><span>	goidcacheend <span style="color:#2b91af">uint64</span>
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// Queue of runnable goroutines. Accessed without lock.</span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// 本地可运行的队列，不用通过锁即可访问</span>
+</span></span><span style="display:flex;"><span>	runqhead <span style="color:#2b91af">uint32</span> <span style="color:#008000">// 队列头</span>
+</span></span><span style="display:flex;"><span>	runqtail <span style="color:#2b91af">uint32</span> <span style="color:#008000">// 队列尾</span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// 使用数组实现的循环队列</span>
+</span></span><span style="display:flex;"><span>	runq     [256]guintptr
+</span></span><span style="display:flex;"><span>	
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// runnext 非空时，代表的是一个 runnable 状态的 G，</span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// 这个 G 被 当前 G 修改为 ready 状态，相比 runq 中的 G 有更高的优先级。</span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// 如果当前 G 还有剩余的可用时间，那么就应该运行这个 G</span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// 运行之后，该 G 会继承当前 G 的剩余时间</span>
+</span></span><span style="display:flex;"><span>	runnext guintptr
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// Available G&#39;s (status == Gdead)</span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// 空闲的 g</span>
+</span></span><span style="display:flex;"><span>	gfree    *g
+</span></span><span style="display:flex;"><span>	gfreecnt <span style="color:#2b91af">int32</span>
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>	sudogcache []*sudog
+</span></span><span style="display:flex;"><span>	sudogbuf   [128]*sudog
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>	tracebuf traceBufPtr
+</span></span><span style="display:flex;"><span>	traceSwept, traceReclaimed <span style="color:#2b91af">uintptr</span>
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>	palloc persistentAlloc <span style="color:#008000">// per-P to avoid mutex</span>
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// Per-P GC state</span>
+</span></span><span style="display:flex;"><span>	gcAssistTime     <span style="color:#2b91af">int64</span> <span style="color:#008000">// Nanoseconds in assistAlloc</span>
+</span></span><span style="display:flex;"><span>	gcBgMarkWorker   guintptr
+</span></span><span style="display:flex;"><span>	gcMarkWorkerMode gcMarkWorkerMode
+</span></span><span style="display:flex;"><span>	runSafePointFn <span style="color:#2b91af">uint32</span> <span style="color:#008000">// if 1, run sched.safePointFn at next safe point</span>
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>	pad [sys.CacheLineSize]<span style="color:#2b91af">byte</span>
+</span></span><span style="display:flex;"><span>}
+</span></span></code></pre></td></tr></table>
+</div>
+</div><p>GPM 三足鼎力，共同成就 Go scheduler。G 需要在 M 上才能运行，M 依赖 P 提供的资源，P 则持有待运行的 G。你中有我，我中有你。</p>
+<p>描述三者的关系：</p>
+<p><img src="../assets/14.png" alt="曹大 golang notes GPM 三者关系" /></p>
+<p>M 会从与它绑定的 P 的本地队列获取可运行的 G，也会从 network poller 里获取可运行的 G，还会从其他 P 偷 G。</p>
+<p>最后我们从宏观上总结一下 GPM，这篇文章尝试从它们的状态流转角度总结。</p>
+<p>首先是 G 的状态流转：</p>
+<p><img src="../assets/15.png" alt="G 的状态流转图" /></p>
+<p>说明一下，上图省略了一些垃圾回收的状态。</p>
+<p>接着是 P 的状态流转：</p>
+<p><img src="../assets/16.png" alt="P 的状态流转图" /></p>
+<blockquote>
+<p>通常情况下（在程序运行时不调整 P 的个数），P 只会在上图中的四种状态下进行切换。 当程序刚开始运行进行初始化时，所有的 P 都处于 <code>_Pgcstop</code> 状态， 随着 P 的初始化（<code>runtime.procresize</code>），会被置于 <code>_Pidle</code>。</p>
+</blockquote>
+<blockquote>
+<p>当 M 需要运行时，会 <code>runtime.acquirep</code> 来使 P 变成 <code>Prunning</code> 状态，并通过 <code>runtime.releasep</code> 来释放。</p>
+</blockquote>
+<blockquote>
+<p>当 G 执行时需要进入系统调用，P 会被设置为 <code>_Psyscall</code>， 如果这个时候被系统监控抢夺（<code>runtime.retake</code>），则 P 会被重新修改为 <code>_Pidle</code>。</p>
+</blockquote>
+<blockquote>
+<p>如果在程序运行中发生 <code>GC</code>，则 P 会被设置为 <code>_Pgcstop</code>， 并在 <code>runtime.startTheWorld</code> 时重新调整为 <code>_Prunning</code>。</p>
+</blockquote>
+<p>最后，我们来看 M 的状态变化：</p>
+<p><img src="../assets/17.png" alt="M 的状态流转图" /></p>
+<p>M 只有自旋和非自旋两种状态。自旋的时候，会努力找工作；找不到的时候会进入非自旋状态，之后会休眠，直到有工作需要处理时，被其他工作线程唤醒，又进入自旋状态。</p>
+
+    
+  </article>
+ 
+      
+
+      <footer class="book-footer">
+        
+  <div class="flex flex-wrap justify-between">
+
+
+
+
+
+</div>
+
+ 
+        <div class="guide-links">
+
+
+</div>
+
+<div id="footer">
+<img alt="知识共享许可协议" style="border-width:0" src="https://licensebuttons.net/l/by-nc-nd/4.0/80x15.png">
+<p>Go宝典 由 <a href="https://qcrao.com">饶全成</a>, <a href="https://changkun.de">欧长坤</a>, 楚秦等
+采用<a rel="license" href="http://creativecommons.org/licenses/by-nc-nd/4.0/">署名-非商业性使用-禁止演绎 4.0 国际许可协议许可</a><br/>
+严禁任何商业行为使用或引用该文档的全部或部分内容，特授权 <a href="https://golang.design">golang.design/go-questions</a> 发布</p>
+</div>
+
+
+<script async src="https://www.googletagmanager.com/gtag/js?id=UA-80889616-4"></script>
+<script>
+window.dataLayer = window.dataLayer || [];
+function gtag(){dataLayer.push(arguments);}
+gtag('js', new Date());
+gtag('config', 'UA-80889616-4');
+</script>
+
+页面总访问量: <span id="urlstat-page-pv"></span>, 访问的用户数: <span id="urlstat-page-uv"></span>
+
+      </footer>
+
+      
+  
+  <div class="book-comments">
+
+</div>
+  
+ 
+
+      <label for="menu-control" class="hidden book-menu-overlay"></label>
+    </div>
+
+    
+    <aside class="book-toc">
+      <div class="book-toc-content">
+        
+  
+<nav id="TableOfContents"></nav>
+
+
+ 
+      </div>
+    </aside>
+    
+  </main>
+
+  
+</body>
+
+</html>
+
+
+
+
+
+
+
+
+
+
+
+

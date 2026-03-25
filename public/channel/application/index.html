@@ -1,0 +1,1721 @@
+<!DOCTYPE html>
+<html lang="en" dir="ltr">
+
+<head>
+  <meta name="generator" content="Hugo 0.159.0">
+  <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="description" content="Channel 和 goroutine 的结合是 Go 并发编程的大杀器。而 Channel 的实际应用也经常让人眼前一亮，通过与 select，cancel，timer 等结合，它能实现各种各样的功能。接下来，我们就要梳理一下 channel 的应用。
+
+  停止信号
+  #
+
+“如何优雅地关闭 channel”那一节已经讲得很多了，这块就略过了。
+channel 用于停止信号的场景还是挺多的，经常是关闭某个 channel 或者向 channel 发送一个元素，使得接收 channel 的那一方获知道此信息，进而做一些其他的操作。
+
+  任务定时
+  #
+
+与 timer 结合，一般有两种玩法：实现超时控制，实现定期执行某个任务。
+有时候，需要执行某项操作，但又不想它耗费太长时间，上一个定时器就可以搞定：
+
+
+1
+2
+3
+4
+5
+
+
+select {
+	case &lt;-time.After(100 * time.Millisecond):
+	case &lt;-s.stopc:
+		return false
+}
+
+
+等待 100 ms 后，如果 s.stopc 还没有读出数据或者被关闭，就直接结束。这是来自 etcd 源码里的一个例子，这样的写法随处可见。">
+<meta name="theme-color" content="#FFFFFF"><meta property="og:url" content="http://golang.design/go-questions/channel/application/">
+  <meta property="og:site_name" content="Go宝典">
+  <meta property="og:title" content="channel 有哪些应用">
+  <meta property="og:description" content="Channel 和 goroutine 的结合是 Go 并发编程的大杀器。而 Channel 的实际应用也经常让人眼前一亮，通过与 select，cancel，timer 等结合，它能实现各种各样的功能。接下来，我们就要梳理一下 channel 的应用。
+停止信号#“如何优雅地关闭 channel”那一节已经讲得很多了，这块就略过了。
+channel 用于停止信号的场景还是挺多的，经常是关闭某个 channel 或者向 channel 发送一个元素，使得接收 channel 的那一方获知道此信息，进而做一些其他的操作。
+任务定时#与 timer 结合，一般有两种玩法：实现超时控制，实现定期执行某个任务。
+有时候，需要执行某项操作，但又不想它耗费太长时间，上一个定时器就可以搞定：
+1 2 3 4 5 select { case &lt;-time.After(100 * time.Millisecond): case &lt;-s.stopc: return false } 等待 100 ms 后，如果 s.stopc 还没有读出数据或者被关闭，就直接结束。这是来自 etcd 源码里的一个例子，这样的写法随处可见。">
+  <meta property="og:locale" content="zh_CN">
+  <meta property="og:type" content="article">
+    <meta property="article:section" content="channel">
+<title>channel 有哪些应用 | Go宝典</title>
+<link rel="manifest" href="/go-questions/manifest.json">
+<link rel="icon" href="/go-questions/favicon.png" type="image/x-icon">
+<link rel="stylesheet" href="/go-questions/book.min.1026023dd873ce4c1427154fefa84d5022ba06f21fb7ebc0bc90c8c5295f58e3.css" integrity="sha256-ECYCPdhzzkwUJxVP76hNUCK6BvIft&#43;vAvJDIxSlfWOM=">
+<script defer src="/go-questions/en.search.min.a56febd3574db773904404c574762b15faf999f15aae7956d7234ead17a2768a.js" integrity="sha256-pW/r01dNt3OQRATFdHYrFfr5mfFarnlW1yNOrReidoo="></script>
+<!--
+Made with Book Theme
+https://github.com/alex-shpak/hugo-book
+-->
+
+
+
+  <script type="text/javascript" async
+src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.5/MathJax.js?config=TeX-MML-AM_CHTML">
+MathJax.Hub.Config({
+  tex2jax: {
+    inlineMath: [['$','$'], ['\\(','\\)']],
+    displayMath: [['$$','$$']],
+    processEscapes: true,
+    processEnvironments: true,
+    skipTags: ['script', 'noscript', 'style', 'textarea', 'pre'],
+    TeX: { equationNumbers: { autoNumber: "AMS" },
+         extensions: ["AMSmath.js", "AMSsymbols.js"] }
+  }
+  });
+  MathJax.Hub.Queue(function() {
+    
+    
+    
+    var all = MathJax.Hub.getAllJax(), i;
+    for(i = 0; i < all.length; i += 1) {
+        all[i].SourceElement().parentNode.className += ' has-jax';
+    }
+  });
+
+  MathJax.Hub.Config({
+  
+  TeX: { equationNumbers: { autoNumber: "AMS" } }
+  });
+</script>
+<script async src="//changkun.de/urlstat/client.js"></script>
+</head>
+
+<body dir="ltr">
+  <input type="checkbox" class="hidden toggle" id="menu-control" />
+  <input type="checkbox" class="hidden toggle" id="toc-control" />
+  <main class="container flex">
+    <aside class="book-menu">
+      <div class="book-menu-content">
+        
+  <nav>
+<h2 class="book-brand">
+  <a href="/go-questions"><span>Go宝典</span>
+  </a>
+</h2>
+
+
+<div class="book-search">
+  <input type="text" id="book-search-input" placeholder="" aria-label="" maxlength="64" data-hotkeys="s/" />
+  <div class="book-search-spinner hidden"></div>
+  <ul id="book-search-results"></ul>
+</div>
+
+
+
+<ul>
+    <li><a href="https://github.com/golang-design/Go-Questions">GitHub</a></li>
+</ul>
+<hr>
+
+
+
+
+
+
+
+  
+
+
+
+  
+  <ul>
+    
+      
+        <li class="book-section-flat" >
+          
+  
+  
+
+  
+    <input type="checkbox" id="section-a65dabd6eab2d958720d860b517524f2" class="toggle"  />
+    <label for="section-a65dabd6eab2d958720d860b517524f2" class="flex justify-between">
+      <a  class="">数组与切片</a>
+      <span>▾</span>
+    </label>
+  
+
+          
+  <ul>
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/slice/vs-array/" class="">数组与切片有什么异同</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/slice/grow/" class="">切片的容量是怎样增长的</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/slice/as-func-param/" class="">切片作为函数参数</a>
+  
+
+        </li>
+      
+    
+  </ul>
+
+        </li>
+      
+    
+      
+        <li class="book-section-flat" >
+          
+  
+  
+
+  
+    <input type="checkbox" id="section-40cb9c7d0ae8dd5d6dc59eea44d4f024" class="toggle"  />
+    <label for="section-40cb9c7d0ae8dd5d6dc59eea44d4f024" class="flex justify-between">
+      <a  class="">哈希表</a>
+      <span>▾</span>
+    </label>
+  
+
+          
+  <ul>
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/principal/" class="">map 的实现原理</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/get/" class="">如何实现两种 get 操作</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/range/" class="">遍历过程</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/assign/" class="">赋值过程</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/delete/" class="">删除过程</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/extend/" class="">扩容过程</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/unordered/" class="">key 为什么是无序的</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/float-as-key/" class="">float 类型可以作为 map 的 key 吗</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/delete-on-range/" class="">可以边遍历边删除吗</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/element-address/" class="">可以对 map 的元素取地址吗</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/compare/" class="">如何比较两个 map 相等</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/thread-safety/" class="">map 是线程安全的吗</a>
+  
+
+        </li>
+      
+    
+  </ul>
+
+        </li>
+      
+    
+      
+        <li class="book-section-flat" >
+          
+  
+  
+
+  
+    <input type="checkbox" id="section-eb16f3b57ba50e2a28f637e99054e45f" class="toggle"  />
+    <label for="section-eb16f3b57ba50e2a28f637e99054e45f" class="flex justify-between">
+      <a  class="">接口</a>
+      <span>▾</span>
+    </label>
+  
+
+          
+  <ul>
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/interface/duck-typing/" class="">Go 语言与鸭子类型的关系</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/interface/receiver/" class="">值接收者和指针接收者的区别</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/interface/iface-eface/" class="">iface 和 eface 的区别是什么</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/interface/dynamic-typing/" class="">接口的动态类型和动态值</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/interface/detect-impl/" class="">编译器自动检测类型是否实现接口</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/interface/construct/" class="">接口的构造过程是怎样的</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/interface/assert/" class="">类型转换和断言的区别</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/interface/convert/" class="">接口转换的原理</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/interface/polymorphism/" class="">如何用 interface 实现多态</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/interface/compare-to-cpp/" class="">Go 接口与 C&#43;&#43; 接口有何异同</a>
+  
+
+        </li>
+      
+    
+  </ul>
+
+        </li>
+      
+    
+      
+        <li class="book-section-flat" >
+          
+  
+  
+
+  
+    <input type="checkbox" id="section-c48fe4210547e2736252b7130a8fb35b" class="toggle" checked />
+    <label for="section-c48fe4210547e2736252b7130a8fb35b" class="flex justify-between">
+      <a  class="">通道</a>
+      <span>▾</span>
+    </label>
+  
+
+          
+  <ul>
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/csp/" class="">什么是 CSP</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/struct/" class="">channel 底层的数据结构是什么</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/send/" class="">向 channel 发送数据的过程是怎样的</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/recv/" class="">从 channel 接收数据的过程是怎样的</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/close/" class="">关闭一个 channel 的过程是怎样的</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/read-on-close/" class="">从一个关闭的 channel 仍然能读出数据吗</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/ops/" class="">操作 channel 的情况总结</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/graceful-close/" class="">如何优雅地关闭 channel</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/principal/" class="">channel 发送和接收元素的本质是什么</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/leak/" class="">channel 在什么情况下会引起资源泄漏</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/happens-before/" class="">关于 channel 的 happened-before 有哪些</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/application/" class=" active">channel 有哪些应用</a>
+  
+
+        </li>
+      
+    
+  </ul>
+
+        </li>
+      
+    
+      
+        <li class="book-section-flat" >
+          
+  
+  
+
+  
+    <input type="checkbox" id="section-cf459139b27c2842a7aade68823220c5" class="toggle"  />
+    <label for="section-cf459139b27c2842a7aade68823220c5" class="flex justify-between">
+      <a  class="">标准库</a>
+      <span>▾</span>
+    </label>
+  
+
+          
+  <ul>
+    
+      
+        <li class="book-section-flat" >
+          
+  
+  
+
+  
+    <input type="checkbox" id="section-ec17239161d133f75c434cb014289362" class="toggle"  />
+    <label for="section-ec17239161d133f75c434cb014289362" class="flex justify-between">
+      <a  class="">context</a>
+      <span>▾</span>
+    </label>
+  
+
+          
+  <ul>
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/context/what/" class="">context 是什么</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/context/why/" class="">context 有什么作用</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/context/find-value/" class="">context.Value 的查找过程是怎样的</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/context/cancel/" class="">context 如何被取消</a>
+  
+
+        </li>
+      
+    
+  </ul>
+
+        </li>
+      
+    
+      
+        <li class="book-section-flat" >
+          
+  
+  
+
+  
+    <input type="checkbox" id="section-0bb1f278e21c7193888a989985c0b0ee" class="toggle"  />
+    <label for="section-0bb1f278e21c7193888a989985c0b0ee" class="flex justify-between">
+      <a  class="">reflect</a>
+      <span>▾</span>
+    </label>
+  
+
+          
+  <ul>
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/reflect/what/" class="">什么是反射</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/reflect/why/" class="">什么情况下需要使用反射</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/reflect/how/" class="">Go 语言如何实现反射</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/reflect/application/" class="">Go 语言中反射有哪些应用</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/reflect/compare/" class="">如何比较两个对象完全相同</a>
+  
+
+        </li>
+      
+    
+  </ul>
+
+        </li>
+      
+    
+      
+        <li class="book-section-flat" >
+          
+  
+  
+
+  
+    <input type="checkbox" id="section-26a1f92d5bf0434e0b92a598ca6e7fb9" class="toggle"  />
+    <label for="section-26a1f92d5bf0434e0b92a598ca6e7fb9" class="flex justify-between">
+      <a  class="">unsafe</a>
+      <span>▾</span>
+    </label>
+  
+
+          
+  <ul>
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/unsafe/pointers/" class="">Go指针和unsafe.Pointer有什么区别</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/unsafe/len/" class="">如何利用unsafe获取slice&amp;map的长度</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/unsafe/modify-private/" class="">如何利用unsafe包修改私有成员</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/unsafe/zero-conv/" class="">如何实现字符串和byte切片的零拷贝转换</a>
+  
+
+        </li>
+      
+    
+  </ul>
+
+        </li>
+      
+    
+  </ul>
+
+        </li>
+      
+    
+      
+        <li class="book-section-flat" >
+          
+  
+  
+
+  
+    <input type="checkbox" id="section-66bb7ef66e8598ada01c7f825054049f" class="toggle"  />
+    <label for="section-66bb7ef66e8598ada01c7f825054049f" class="flex justify-between">
+      <a  class="">编译</a>
+      <span>▾</span>
+    </label>
+  
+
+          
+  <ul>
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/compile/escape/" class="">逃逸分析是怎么进行的</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/compile/gopath/" class="">GoRoot 和 GoPath 有什么用</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/compile/link-process/" class="">Go 编译链接过程概述</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/compile/cmd/" class="">Go 编译相关的命令详解</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/compile/booting/" class="">Go 程序启动过程是怎样的</a>
+  
+
+        </li>
+      
+    
+  </ul>
+
+        </li>
+      
+    
+      
+        <li class="book-section-flat" >
+          
+  
+  
+
+  
+    <input type="checkbox" id="section-b8b0dd60ee3ee64dc6ccaf3bced28b29" class="toggle"  />
+    <label for="section-b8b0dd60ee3ee64dc6ccaf3bced28b29" class="flex justify-between">
+      <a  class="">调度器</a>
+      <span>▾</span>
+    </label>
+  
+
+          
+  <ul>
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/goroutine-vs-thread/" class="">goroutine 和线程的区别</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/what-is/" class="">什么是 Go Scheduler</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/when/" class="">goroutine 调度时机有哪些</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/mn-model/" class="">什么是M:N模型</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/work-steal/" class="">什么是工作窃取</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/gpm/" class="">GPM 是什么</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/init/" class="">描述 scheduler 的初始化过程</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/main-goroutine/" class="">主 goroutine 如何创建</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/g0-stack/" class="">g0 栈何用户栈如何切换</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/sched-loop-boot/" class="">schedule 循环如何启动</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/goroutine-exit/" class="">goroutine 如何退出</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/sched-loop-exec/" class="">schedule 循环如何运转</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/m-worker/" class="">M 如何找工作</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/sysmon/" class="">sysmon 后台监控线程做了什么</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/sched-trap/" class="">一个调度相关的陷阱</a>
+  
+
+        </li>
+      
+    
+  </ul>
+
+        </li>
+      
+    
+      
+        <li class="book-section-flat" >
+          
+  
+  
+
+  
+    <input type="checkbox" id="section-49561050d01c571480cc1c3317ee29d7" class="toggle"  />
+    <label for="section-49561050d01c571480cc1c3317ee29d7" class="flex justify-between">
+      <a  class="">垃圾回收器</a>
+      <span>▾</span>
+    </label>
+  
+
+          
+  <ul>
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/memgc/principal/" class="">垃圾回收的认识</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/memgc/impl/" class="">垃圾回收机制的实现</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/memgc/optimize/" class="">垃圾回收的优化问题</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/memgc/history/" class="">历史及演进</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/memgc/summary/" class="">总结</a>
+  
+
+        </li>
+      
+    
+  </ul>
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/errata/" class="">勘误表</a>
+  
+
+        </li>
+      
+    
+  </ul>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<hr>
+<ul>
+<li style="font-style:italic">
+</li>
+</ul>
+版权所有 &copy; 2022 <a href="https://qcrao.com">饶全成</a>, <a href="https://changkun.de">欧长坤</a>, 楚秦等<br/><br/>
+
+The <a href="https://golang.design">golang.design</a> Initialtive
+</nav>
+
+
+
+
+  <script>(function(){var e=document.querySelector("aside.book-menu nav");addEventListener("beforeunload",function(){localStorage.setItem("menu.scrollTop",e.scrollTop)}),e.scrollTop=localStorage.getItem("menu.scrollTop")})()</script>
+
+
+ 
+      </div>
+    </aside>
+
+    <div class="book-page">
+      <header class="book-header">
+        
+  <div class="flex align-center justify-between">
+  <label for="menu-control">
+    <img src="/go-questions/svg/menu.svg" class="book-icon" alt="Menu" />
+  </label>
+
+  <strong>channel 有哪些应用</strong>
+
+  <label for="toc-control">
+    
+    <img src="/go-questions/svg/toc.svg" class="book-icon" alt="Table of Contents" />
+    
+  </label>
+</div>
+
+
+  
+  <aside class="hidden clearfix">
+    
+  
+<nav id="TableOfContents"></nav>
+
+
+
+  </aside>
+  
+ 
+      </header>
+
+      
+      
+  <article class="markdown"><p>Channel 和 goroutine 的结合是 Go 并发编程的大杀器。而 Channel 的实际应用也经常让人眼前一亮，通过与 select，cancel，timer 等结合，它能实现各种各样的功能。接下来，我们就要梳理一下 channel 的应用。</p>
+<h1 id="停止信号">
+  停止信号
+  <a class="anchor" href="#%e5%81%9c%e6%ad%a2%e4%bf%a1%e5%8f%b7">#</a>
+</h1>
+<p>“如何优雅地关闭 channel”那一节已经讲得很多了，这块就略过了。</p>
+<p>channel 用于停止信号的场景还是挺多的，经常是关闭某个 channel 或者向 channel 发送一个元素，使得接收 channel 的那一方获知道此信息，进而做一些其他的操作。</p>
+<h1 id="任务定时">
+  任务定时
+  <a class="anchor" href="#%e4%bb%bb%e5%8a%a1%e5%ae%9a%e6%97%b6">#</a>
+</h1>
+<p>与 timer 结合，一般有两种玩法：实现超时控制，实现定期执行某个任务。</p>
+<p>有时候，需要执行某项操作，但又不想它耗费太长时间，上一个定时器就可以搞定：</p>
+<div class="highlight"><div style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;">
+<table style="border-spacing:0;padding:0;margin:0;border:0;"><tr><td style="vertical-align:top;padding:0;margin:0;border:0;">
+<pre tabindex="0" style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;"><code><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">1
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">2
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">3
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">4
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">5
+</span></code></pre></td>
+<td style="vertical-align:top;padding:0;margin:0;border:0;;width:100%">
+<pre tabindex="0" style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;"><code class="language-golang" data-lang="golang"><span style="display:flex;"><span><span style="color:#00f">select</span> {
+</span></span><span style="display:flex;"><span>	<span style="color:#00f">case</span> &lt;-time.After(100 * time.Millisecond):
+</span></span><span style="display:flex;"><span>	<span style="color:#00f">case</span> &lt;-s.stopc:
+</span></span><span style="display:flex;"><span>		<span style="color:#00f">return</span> <span style="color:#00f">false</span>
+</span></span><span style="display:flex;"><span>}
+</span></span></code></pre></td></tr></table>
+</div>
+</div><p>等待 100 ms 后，如果 s.stopc 还没有读出数据或者被关闭，就直接结束。这是来自 etcd 源码里的一个例子，这样的写法随处可见。</p>
+<p>定时执行某个任务，也比较简单：</p>
+<div class="highlight"><div style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;">
+<table style="border-spacing:0;padding:0;margin:0;border:0;"><tr><td style="vertical-align:top;padding:0;margin:0;border:0;">
+<pre tabindex="0" style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;"><code><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 1
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 2
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 3
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 4
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 5
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 6
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 7
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 8
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 9
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">10
+</span></code></pre></td>
+<td style="vertical-align:top;padding:0;margin:0;border:0;;width:100%">
+<pre tabindex="0" style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;"><code class="language-golang" data-lang="golang"><span style="display:flex;"><span><span style="color:#00f">func</span> worker() {
+</span></span><span style="display:flex;"><span>	ticker := time.Tick(1 * time.Second)
+</span></span><span style="display:flex;"><span>	<span style="color:#00f">for</span> {
+</span></span><span style="display:flex;"><span>		<span style="color:#00f">select</span> {
+</span></span><span style="display:flex;"><span>		<span style="color:#00f">case</span> &lt;- ticker:
+</span></span><span style="display:flex;"><span>			<span style="color:#008000">// 执行定时任务</span>
+</span></span><span style="display:flex;"><span>			fmt.Println(<span style="color:#a31515">&#34;执行 1s 定时任务&#34;</span>)
+</span></span><span style="display:flex;"><span>		}
+</span></span><span style="display:flex;"><span>	}
+</span></span><span style="display:flex;"><span>}
+</span></span></code></pre></td></tr></table>
+</div>
+</div><p>每隔 1 秒种，执行一次定时任务。</p>
+<h1 id="解耦生产方和消费方">
+  解耦生产方和消费方
+  <a class="anchor" href="#%e8%a7%a3%e8%80%a6%e7%94%9f%e4%ba%a7%e6%96%b9%e5%92%8c%e6%b6%88%e8%b4%b9%e6%96%b9">#</a>
+</h1>
+<p>服务启动时，启动 n 个 worker，作为工作协程池，这些协程工作在一个 <code>for {}</code> 无限循环里，从某个 channel 消费工作任务并执行：</p>
+<div class="highlight"><div style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;">
+<table style="border-spacing:0;padding:0;margin:0;border:0;"><tr><td style="vertical-align:top;padding:0;margin:0;border:0;">
+<pre tabindex="0" style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;"><code><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 1
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 2
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 3
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 4
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 5
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 6
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 7
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 8
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 9
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">10
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">11
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">12
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">13
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">14
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">15
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">16
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">17
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">18
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">19
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">20
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">21
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">22
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">23
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">24
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">25
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">26
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">27
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">28
+</span></code></pre></td>
+<td style="vertical-align:top;padding:0;margin:0;border:0;;width:100%">
+<pre tabindex="0" style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;"><code class="language-golang" data-lang="golang"><span style="display:flex;"><span><span style="color:#00f">func</span> main() {
+</span></span><span style="display:flex;"><span>	taskCh := make(<span style="color:#00f">chan</span> <span style="color:#2b91af">int</span>, 100)
+</span></span><span style="display:flex;"><span>	<span style="color:#00f">go</span> worker(taskCh)
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>    <span style="color:#008000">// 塞任务</span>
+</span></span><span style="display:flex;"><span>	<span style="color:#00f">for</span> i := 0; i &lt; 10; i++ {
+</span></span><span style="display:flex;"><span>		taskCh &lt;- i
+</span></span><span style="display:flex;"><span>	}
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>    <span style="color:#008000">// 等待 1 小时 </span>
+</span></span><span style="display:flex;"><span>	<span style="color:#00f">select</span> {
+</span></span><span style="display:flex;"><span>	<span style="color:#00f">case</span> &lt;-time.After(time.Hour):
+</span></span><span style="display:flex;"><span>	}
+</span></span><span style="display:flex;"><span>}
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span><span style="color:#00f">func</span> worker(taskCh &lt;-<span style="color:#00f">chan</span> <span style="color:#2b91af">int</span>) {
+</span></span><span style="display:flex;"><span>	<span style="color:#00f">const</span> N = 5
+</span></span><span style="display:flex;"><span>	<span style="color:#008000">// 启动 5 个工作协程</span>
+</span></span><span style="display:flex;"><span>	<span style="color:#00f">for</span> i := 0; i &lt; N; i++ {
+</span></span><span style="display:flex;"><span>		<span style="color:#00f">go</span> <span style="color:#00f">func</span>(id <span style="color:#2b91af">int</span>) {
+</span></span><span style="display:flex;"><span>			<span style="color:#00f">for</span> {
+</span></span><span style="display:flex;"><span>				task := &lt;- taskCh
+</span></span><span style="display:flex;"><span>				fmt.Printf(<span style="color:#a31515">&#34;finish task: %d by worker %d\n&#34;</span>, task, id)
+</span></span><span style="display:flex;"><span>				time.Sleep(time.Second)
+</span></span><span style="display:flex;"><span>			}
+</span></span><span style="display:flex;"><span>		}(i)
+</span></span><span style="display:flex;"><span>	}
+</span></span><span style="display:flex;"><span>}
+</span></span></code></pre></td></tr></table>
+</div>
+</div><p>5 个工作协程在不断地从工作队列里取任务，生产方只管往 channel 发送任务即可，解耦生产方和消费方。</p>
+<p>程序输出：</p>
+<div class="highlight"><div style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;">
+<table style="border-spacing:0;padding:0;margin:0;border:0;"><tr><td style="vertical-align:top;padding:0;margin:0;border:0;">
+<pre tabindex="0" style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;"><code><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 1
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 2
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 3
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 4
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 5
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 6
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 7
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 8
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 9
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">10
+</span></code></pre></td>
+<td style="vertical-align:top;padding:0;margin:0;border:0;;width:100%">
+<pre tabindex="0" style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;"><code class="language-shell" data-lang="shell"><span style="display:flex;"><span>finish task: 1 by worker 4
+</span></span><span style="display:flex;"><span>finish task: 2 by worker 2
+</span></span><span style="display:flex;"><span>finish task: 4 by worker 3
+</span></span><span style="display:flex;"><span>finish task: 3 by worker 1
+</span></span><span style="display:flex;"><span>finish task: 0 by worker 0
+</span></span><span style="display:flex;"><span>finish task: 6 by worker 0
+</span></span><span style="display:flex;"><span>finish task: 8 by worker 3
+</span></span><span style="display:flex;"><span>finish task: 9 by worker 1
+</span></span><span style="display:flex;"><span>finish task: 7 by worker 4
+</span></span><span style="display:flex;"><span>finish task: 5 by worker 2
+</span></span></code></pre></td></tr></table>
+</div>
+</div><h1 id="控制并发数">
+  控制并发数
+  <a class="anchor" href="#%e6%8e%a7%e5%88%b6%e5%b9%b6%e5%8f%91%e6%95%b0">#</a>
+</h1>
+<p>有时需要定时执行几百个任务，例如每天定时按城市来执行一些离线计算的任务。但是并发数又不能太高，因为任务执行过程依赖第三方的一些资源，对请求的速率有限制。这时就可以通过 channel 来控制并发数。</p>
+<p>下面的例子来自《Go 语言高级编程》：</p>
+<div class="highlight"><div style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;">
+<table style="border-spacing:0;padding:0;margin:0;border:0;"><tr><td style="vertical-align:top;padding:0;margin:0;border:0;">
+<pre tabindex="0" style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;"><code><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 1
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 2
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 3
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 4
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 5
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 6
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 7
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 8
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f"> 9
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">10
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">11
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">12
+</span><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">13
+</span></code></pre></td>
+<td style="vertical-align:top;padding:0;margin:0;border:0;;width:100%">
+<pre tabindex="0" style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;"><code class="language-golang" data-lang="golang"><span style="display:flex;"><span><span style="color:#00f">var</span> limit = make(<span style="color:#00f">chan</span> <span style="color:#2b91af">int</span>, 3)
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span><span style="color:#00f">func</span> main() {
+</span></span><span style="display:flex;"><span>    <span style="color:#008000">// …………</span>
+</span></span><span style="display:flex;"><span>    <span style="color:#00f">for</span> _, w := <span style="color:#00f">range</span> work {
+</span></span><span style="display:flex;"><span>        <span style="color:#00f">go</span> <span style="color:#00f">func</span>() {
+</span></span><span style="display:flex;"><span>            limit &lt;- 1
+</span></span><span style="display:flex;"><span>            w()
+</span></span><span style="display:flex;"><span>            &lt;-limit
+</span></span><span style="display:flex;"><span>        }()
+</span></span><span style="display:flex;"><span>    }
+</span></span><span style="display:flex;"><span>    <span style="color:#008000">// …………</span>
+</span></span><span style="display:flex;"><span>}
+</span></span></code></pre></td></tr></table>
+</div>
+</div><p>构建一个缓冲型的 channel，容量为 3。接着遍历任务列表，每个任务启动一个 goroutine 去完成。真正执行任务，访问第三方的动作在 w() 中完成，在执行 w() 之前，先要从 limit 中拿“许可证”，拿到许可证之后，才能执行 w()，并且在执行完任务，要将“许可证”归还。这样就可以控制同时运行的 goroutine 数。</p>
+<p>这里，<code>limit &lt;- 1</code> 放在 func 内部而不是外部，原因是：</p>
+<blockquote>
+<p>如果在外层，就是控制系统 goroutine 的数量，可能会阻塞 for 循环，影响业务逻辑。</p>
+</blockquote>
+<blockquote>
+<p>limit 其实和逻辑无关，只是性能调优，放在内层和外层的语义不太一样。</p>
+</blockquote>
+<p>还有一点要注意的是，如果 w() 发生 panic，那“许可证”可能就还不回去了，因此需要使用 defer 来保证。</p>
+<h1 id="参考资料">
+  参考资料
+  <a class="anchor" href="#%e5%8f%82%e8%80%83%e8%b5%84%e6%96%99">#</a>
+</h1>
+<p>【channel 应用】https://www.s0nnet.com/archives/go-channels-practice</p>
+<p>【应用举例】https://zhuyasen.com/post/go_queue.html</p>
+<p>【应用】https://tonybai.com/2014/09/29/a-channel-compendium-for-golang/</p>
+<p>【Go 语言高级并发编程】https://chai2010.cn/advanced-go-programming-book/</p>
+
+    
+  </article>
+ 
+      
+
+      <footer class="book-footer">
+        
+  <div class="flex flex-wrap justify-between">
+
+
+
+
+
+</div>
+
+ 
+        <div class="guide-links">
+
+
+</div>
+
+<div id="footer">
+<img alt="知识共享许可协议" style="border-width:0" src="https://licensebuttons.net/l/by-nc-nd/4.0/80x15.png">
+<p>Go宝典 由 <a href="https://qcrao.com">饶全成</a>, <a href="https://changkun.de">欧长坤</a>, 楚秦等
+采用<a rel="license" href="http://creativecommons.org/licenses/by-nc-nd/4.0/">署名-非商业性使用-禁止演绎 4.0 国际许可协议许可</a><br/>
+严禁任何商业行为使用或引用该文档的全部或部分内容，特授权 <a href="https://golang.design">golang.design/go-questions</a> 发布</p>
+</div>
+
+
+<script async src="https://www.googletagmanager.com/gtag/js?id=UA-80889616-4"></script>
+<script>
+window.dataLayer = window.dataLayer || [];
+function gtag(){dataLayer.push(arguments);}
+gtag('js', new Date());
+gtag('config', 'UA-80889616-4');
+</script>
+
+页面总访问量: <span id="urlstat-page-pv"></span>, 访问的用户数: <span id="urlstat-page-uv"></span>
+
+      </footer>
+
+      
+  
+  <div class="book-comments">
+
+</div>
+  
+ 
+
+      <label for="menu-control" class="hidden book-menu-overlay"></label>
+    </div>
+
+    
+    <aside class="book-toc">
+      <div class="book-toc-content">
+        
+  
+<nav id="TableOfContents"></nav>
+
+
+ 
+      </div>
+    </aside>
+    
+  </main>
+
+  
+</body>
+
+</html>
+
+
+
+
+
+
+
+
+
+
+
+

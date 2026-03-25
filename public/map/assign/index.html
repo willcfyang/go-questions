@@ -1,0 +1,1563 @@
+<!DOCTYPE html>
+<html lang="en" dir="ltr">
+
+<head>
+  <meta name="generator" content="Hugo 0.159.0">
+  <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="description" content="通过汇编语言可以看到，向 map 中插入或者修改 key，最终调用的是 mapassign 函数。
+实际上插入或修改 key 的语法是一样的，只不过前者操作的 key 在 map 中不存在，而后者操作的 key 存在 map 中。
+mapassign 有一个系列的函数，根据 key 类型的不同，编译器会将其优化为相应的“快速函数”。
+
+  
+      
+          key 类型
+          插入
+      
+  
+  
+      
+          uint32
+          mapassign_fast32(t *maptype, h *hmap, key uint32) unsafe.Pointer
+      
+      
+          uint64
+          mapassign_fast64(t *maptype, h *hmap, key uint64) unsafe.Pointer
+      
+      
+          string
+          mapassign_faststr(t *maptype, h *hmap, ky string) unsafe.Pointer
+      
+  
+
+我们只用研究最一般的赋值函数 mapassign。
+整体来看，流程非常得简单：对 key 计算 hash 值，根据 hash 值按照之前的流程，找到要赋值的位置（可能是插入新 key，也可能是更新老 key），对相应位置进行赋值。
+源码大体和之前讲的类似，核心还是一个双层循环，外层遍历 bucket 和它的 overflow bucket，内层遍历整个 bucket 的各个 cell。限于篇幅，这部分代码的注释我也不展示了，有兴趣的可以去看，保证理解了这篇文章内容后，能够看懂。
+我这里会针对这个过程提几点重要的。
+函数首先会检查 map 的标志位 flags。如果 flags 的写标志位此时被置 1 了，说明有其他协程在执行“写”操作，进而导致程序 panic。这也说明了 map 对协程是不安全的。">
+<meta name="theme-color" content="#FFFFFF"><meta property="og:url" content="http://golang.design/go-questions/map/assign/">
+  <meta property="og:site_name" content="Go宝典">
+  <meta property="og:title" content="赋值过程">
+  <meta property="og:description" content="通过汇编语言可以看到，向 map 中插入或者修改 key，最终调用的是 mapassign 函数。
+实际上插入或修改 key 的语法是一样的，只不过前者操作的 key 在 map 中不存在，而后者操作的 key 存在 map 中。
+mapassign 有一个系列的函数，根据 key 类型的不同，编译器会将其优化为相应的“快速函数”。
+key 类型 插入 uint32 mapassign_fast32(t *maptype, h *hmap, key uint32) unsafe.Pointer uint64 mapassign_fast64(t *maptype, h *hmap, key uint64) unsafe.Pointer string mapassign_faststr(t *maptype, h *hmap, ky string) unsafe.Pointer 我们只用研究最一般的赋值函数 mapassign。
+整体来看，流程非常得简单：对 key 计算 hash 值，根据 hash 值按照之前的流程，找到要赋值的位置（可能是插入新 key，也可能是更新老 key），对相应位置进行赋值。
+源码大体和之前讲的类似，核心还是一个双层循环，外层遍历 bucket 和它的 overflow bucket，内层遍历整个 bucket 的各个 cell。限于篇幅，这部分代码的注释我也不展示了，有兴趣的可以去看，保证理解了这篇文章内容后，能够看懂。
+我这里会针对这个过程提几点重要的。
+函数首先会检查 map 的标志位 flags。如果 flags 的写标志位此时被置 1 了，说明有其他协程在执行“写”操作，进而导致程序 panic。这也说明了 map 对协程是不安全的。">
+  <meta property="og:locale" content="zh_CN">
+  <meta property="og:type" content="article">
+    <meta property="article:section" content="map">
+<title>赋值过程 | Go宝典</title>
+<link rel="manifest" href="/go-questions/manifest.json">
+<link rel="icon" href="/go-questions/favicon.png" type="image/x-icon">
+<link rel="stylesheet" href="/go-questions/book.min.1026023dd873ce4c1427154fefa84d5022ba06f21fb7ebc0bc90c8c5295f58e3.css" integrity="sha256-ECYCPdhzzkwUJxVP76hNUCK6BvIft&#43;vAvJDIxSlfWOM=">
+<script defer src="/go-questions/en.search.min.a56febd3574db773904404c574762b15faf999f15aae7956d7234ead17a2768a.js" integrity="sha256-pW/r01dNt3OQRATFdHYrFfr5mfFarnlW1yNOrReidoo="></script>
+<!--
+Made with Book Theme
+https://github.com/alex-shpak/hugo-book
+-->
+
+
+
+  <script type="text/javascript" async
+src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.5/MathJax.js?config=TeX-MML-AM_CHTML">
+MathJax.Hub.Config({
+  tex2jax: {
+    inlineMath: [['$','$'], ['\\(','\\)']],
+    displayMath: [['$$','$$']],
+    processEscapes: true,
+    processEnvironments: true,
+    skipTags: ['script', 'noscript', 'style', 'textarea', 'pre'],
+    TeX: { equationNumbers: { autoNumber: "AMS" },
+         extensions: ["AMSmath.js", "AMSsymbols.js"] }
+  }
+  });
+  MathJax.Hub.Queue(function() {
+    
+    
+    
+    var all = MathJax.Hub.getAllJax(), i;
+    for(i = 0; i < all.length; i += 1) {
+        all[i].SourceElement().parentNode.className += ' has-jax';
+    }
+  });
+
+  MathJax.Hub.Config({
+  
+  TeX: { equationNumbers: { autoNumber: "AMS" } }
+  });
+</script>
+<script async src="//changkun.de/urlstat/client.js"></script>
+</head>
+
+<body dir="ltr">
+  <input type="checkbox" class="hidden toggle" id="menu-control" />
+  <input type="checkbox" class="hidden toggle" id="toc-control" />
+  <main class="container flex">
+    <aside class="book-menu">
+      <div class="book-menu-content">
+        
+  <nav>
+<h2 class="book-brand">
+  <a href="/go-questions"><span>Go宝典</span>
+  </a>
+</h2>
+
+
+<div class="book-search">
+  <input type="text" id="book-search-input" placeholder="" aria-label="" maxlength="64" data-hotkeys="s/" />
+  <div class="book-search-spinner hidden"></div>
+  <ul id="book-search-results"></ul>
+</div>
+
+
+
+<ul>
+    <li><a href="https://github.com/golang-design/Go-Questions">GitHub</a></li>
+</ul>
+<hr>
+
+
+
+
+
+
+
+  
+
+
+
+  
+  <ul>
+    
+      
+        <li class="book-section-flat" >
+          
+  
+  
+
+  
+    <input type="checkbox" id="section-a65dabd6eab2d958720d860b517524f2" class="toggle"  />
+    <label for="section-a65dabd6eab2d958720d860b517524f2" class="flex justify-between">
+      <a  class="">数组与切片</a>
+      <span>▾</span>
+    </label>
+  
+
+          
+  <ul>
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/slice/vs-array/" class="">数组与切片有什么异同</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/slice/grow/" class="">切片的容量是怎样增长的</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/slice/as-func-param/" class="">切片作为函数参数</a>
+  
+
+        </li>
+      
+    
+  </ul>
+
+        </li>
+      
+    
+      
+        <li class="book-section-flat" >
+          
+  
+  
+
+  
+    <input type="checkbox" id="section-40cb9c7d0ae8dd5d6dc59eea44d4f024" class="toggle" checked />
+    <label for="section-40cb9c7d0ae8dd5d6dc59eea44d4f024" class="flex justify-between">
+      <a  class="">哈希表</a>
+      <span>▾</span>
+    </label>
+  
+
+          
+  <ul>
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/principal/" class="">map 的实现原理</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/get/" class="">如何实现两种 get 操作</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/range/" class="">遍历过程</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/assign/" class=" active">赋值过程</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/delete/" class="">删除过程</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/extend/" class="">扩容过程</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/unordered/" class="">key 为什么是无序的</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/float-as-key/" class="">float 类型可以作为 map 的 key 吗</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/delete-on-range/" class="">可以边遍历边删除吗</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/element-address/" class="">可以对 map 的元素取地址吗</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/compare/" class="">如何比较两个 map 相等</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/map/thread-safety/" class="">map 是线程安全的吗</a>
+  
+
+        </li>
+      
+    
+  </ul>
+
+        </li>
+      
+    
+      
+        <li class="book-section-flat" >
+          
+  
+  
+
+  
+    <input type="checkbox" id="section-eb16f3b57ba50e2a28f637e99054e45f" class="toggle"  />
+    <label for="section-eb16f3b57ba50e2a28f637e99054e45f" class="flex justify-between">
+      <a  class="">接口</a>
+      <span>▾</span>
+    </label>
+  
+
+          
+  <ul>
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/interface/duck-typing/" class="">Go 语言与鸭子类型的关系</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/interface/receiver/" class="">值接收者和指针接收者的区别</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/interface/iface-eface/" class="">iface 和 eface 的区别是什么</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/interface/dynamic-typing/" class="">接口的动态类型和动态值</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/interface/detect-impl/" class="">编译器自动检测类型是否实现接口</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/interface/construct/" class="">接口的构造过程是怎样的</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/interface/assert/" class="">类型转换和断言的区别</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/interface/convert/" class="">接口转换的原理</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/interface/polymorphism/" class="">如何用 interface 实现多态</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/interface/compare-to-cpp/" class="">Go 接口与 C&#43;&#43; 接口有何异同</a>
+  
+
+        </li>
+      
+    
+  </ul>
+
+        </li>
+      
+    
+      
+        <li class="book-section-flat" >
+          
+  
+  
+
+  
+    <input type="checkbox" id="section-c48fe4210547e2736252b7130a8fb35b" class="toggle"  />
+    <label for="section-c48fe4210547e2736252b7130a8fb35b" class="flex justify-between">
+      <a  class="">通道</a>
+      <span>▾</span>
+    </label>
+  
+
+          
+  <ul>
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/csp/" class="">什么是 CSP</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/struct/" class="">channel 底层的数据结构是什么</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/send/" class="">向 channel 发送数据的过程是怎样的</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/recv/" class="">从 channel 接收数据的过程是怎样的</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/close/" class="">关闭一个 channel 的过程是怎样的</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/read-on-close/" class="">从一个关闭的 channel 仍然能读出数据吗</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/ops/" class="">操作 channel 的情况总结</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/graceful-close/" class="">如何优雅地关闭 channel</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/principal/" class="">channel 发送和接收元素的本质是什么</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/leak/" class="">channel 在什么情况下会引起资源泄漏</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/happens-before/" class="">关于 channel 的 happened-before 有哪些</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/channel/application/" class="">channel 有哪些应用</a>
+  
+
+        </li>
+      
+    
+  </ul>
+
+        </li>
+      
+    
+      
+        <li class="book-section-flat" >
+          
+  
+  
+
+  
+    <input type="checkbox" id="section-cf459139b27c2842a7aade68823220c5" class="toggle"  />
+    <label for="section-cf459139b27c2842a7aade68823220c5" class="flex justify-between">
+      <a  class="">标准库</a>
+      <span>▾</span>
+    </label>
+  
+
+          
+  <ul>
+    
+      
+        <li class="book-section-flat" >
+          
+  
+  
+
+  
+    <input type="checkbox" id="section-ec17239161d133f75c434cb014289362" class="toggle"  />
+    <label for="section-ec17239161d133f75c434cb014289362" class="flex justify-between">
+      <a  class="">context</a>
+      <span>▾</span>
+    </label>
+  
+
+          
+  <ul>
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/context/what/" class="">context 是什么</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/context/why/" class="">context 有什么作用</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/context/find-value/" class="">context.Value 的查找过程是怎样的</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/context/cancel/" class="">context 如何被取消</a>
+  
+
+        </li>
+      
+    
+  </ul>
+
+        </li>
+      
+    
+      
+        <li class="book-section-flat" >
+          
+  
+  
+
+  
+    <input type="checkbox" id="section-0bb1f278e21c7193888a989985c0b0ee" class="toggle"  />
+    <label for="section-0bb1f278e21c7193888a989985c0b0ee" class="flex justify-between">
+      <a  class="">reflect</a>
+      <span>▾</span>
+    </label>
+  
+
+          
+  <ul>
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/reflect/what/" class="">什么是反射</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/reflect/why/" class="">什么情况下需要使用反射</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/reflect/how/" class="">Go 语言如何实现反射</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/reflect/application/" class="">Go 语言中反射有哪些应用</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/reflect/compare/" class="">如何比较两个对象完全相同</a>
+  
+
+        </li>
+      
+    
+  </ul>
+
+        </li>
+      
+    
+      
+        <li class="book-section-flat" >
+          
+  
+  
+
+  
+    <input type="checkbox" id="section-26a1f92d5bf0434e0b92a598ca6e7fb9" class="toggle"  />
+    <label for="section-26a1f92d5bf0434e0b92a598ca6e7fb9" class="flex justify-between">
+      <a  class="">unsafe</a>
+      <span>▾</span>
+    </label>
+  
+
+          
+  <ul>
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/unsafe/pointers/" class="">Go指针和unsafe.Pointer有什么区别</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/unsafe/len/" class="">如何利用unsafe获取slice&amp;map的长度</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/unsafe/modify-private/" class="">如何利用unsafe包修改私有成员</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/stdlib/unsafe/zero-conv/" class="">如何实现字符串和byte切片的零拷贝转换</a>
+  
+
+        </li>
+      
+    
+  </ul>
+
+        </li>
+      
+    
+  </ul>
+
+        </li>
+      
+    
+      
+        <li class="book-section-flat" >
+          
+  
+  
+
+  
+    <input type="checkbox" id="section-66bb7ef66e8598ada01c7f825054049f" class="toggle"  />
+    <label for="section-66bb7ef66e8598ada01c7f825054049f" class="flex justify-between">
+      <a  class="">编译</a>
+      <span>▾</span>
+    </label>
+  
+
+          
+  <ul>
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/compile/escape/" class="">逃逸分析是怎么进行的</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/compile/gopath/" class="">GoRoot 和 GoPath 有什么用</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/compile/link-process/" class="">Go 编译链接过程概述</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/compile/cmd/" class="">Go 编译相关的命令详解</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/compile/booting/" class="">Go 程序启动过程是怎样的</a>
+  
+
+        </li>
+      
+    
+  </ul>
+
+        </li>
+      
+    
+      
+        <li class="book-section-flat" >
+          
+  
+  
+
+  
+    <input type="checkbox" id="section-b8b0dd60ee3ee64dc6ccaf3bced28b29" class="toggle"  />
+    <label for="section-b8b0dd60ee3ee64dc6ccaf3bced28b29" class="flex justify-between">
+      <a  class="">调度器</a>
+      <span>▾</span>
+    </label>
+  
+
+          
+  <ul>
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/goroutine-vs-thread/" class="">goroutine 和线程的区别</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/what-is/" class="">什么是 Go Scheduler</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/when/" class="">goroutine 调度时机有哪些</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/mn-model/" class="">什么是M:N模型</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/work-steal/" class="">什么是工作窃取</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/gpm/" class="">GPM 是什么</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/init/" class="">描述 scheduler 的初始化过程</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/main-goroutine/" class="">主 goroutine 如何创建</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/g0-stack/" class="">g0 栈何用户栈如何切换</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/sched-loop-boot/" class="">schedule 循环如何启动</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/goroutine-exit/" class="">goroutine 如何退出</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/sched-loop-exec/" class="">schedule 循环如何运转</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/m-worker/" class="">M 如何找工作</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/sysmon/" class="">sysmon 后台监控线程做了什么</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/sched/sched-trap/" class="">一个调度相关的陷阱</a>
+  
+
+        </li>
+      
+    
+  </ul>
+
+        </li>
+      
+    
+      
+        <li class="book-section-flat" >
+          
+  
+  
+
+  
+    <input type="checkbox" id="section-49561050d01c571480cc1c3317ee29d7" class="toggle"  />
+    <label for="section-49561050d01c571480cc1c3317ee29d7" class="flex justify-between">
+      <a  class="">垃圾回收器</a>
+      <span>▾</span>
+    </label>
+  
+
+          
+  <ul>
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/memgc/principal/" class="">垃圾回收的认识</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/memgc/impl/" class="">垃圾回收机制的实现</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/memgc/optimize/" class="">垃圾回收的优化问题</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/memgc/history/" class="">历史及演进</a>
+  
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/memgc/summary/" class="">总结</a>
+  
+
+        </li>
+      
+    
+  </ul>
+
+        </li>
+      
+    
+      
+        <li>
+          
+  
+  
+
+  
+    <a href="http://golang.design/go-questions/errata/" class="">勘误表</a>
+  
+
+        </li>
+      
+    
+  </ul>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<hr>
+<ul>
+<li style="font-style:italic">
+</li>
+</ul>
+版权所有 &copy; 2022 <a href="https://qcrao.com">饶全成</a>, <a href="https://changkun.de">欧长坤</a>, 楚秦等<br/><br/>
+
+The <a href="https://golang.design">golang.design</a> Initialtive
+</nav>
+
+
+
+
+  <script>(function(){var e=document.querySelector("aside.book-menu nav");addEventListener("beforeunload",function(){localStorage.setItem("menu.scrollTop",e.scrollTop)}),e.scrollTop=localStorage.getItem("menu.scrollTop")})()</script>
+
+
+ 
+      </div>
+    </aside>
+
+    <div class="book-page">
+      <header class="book-header">
+        
+  <div class="flex align-center justify-between">
+  <label for="menu-control">
+    <img src="/go-questions/svg/menu.svg" class="book-icon" alt="Menu" />
+  </label>
+
+  <strong>赋值过程</strong>
+
+  <label for="toc-control">
+    
+    <img src="/go-questions/svg/toc.svg" class="book-icon" alt="Table of Contents" />
+    
+  </label>
+</div>
+
+
+  
+  <aside class="hidden clearfix">
+    
+  
+<nav id="TableOfContents"></nav>
+
+
+
+  </aside>
+  
+ 
+      </header>
+
+      
+      
+  <article class="markdown"><p>通过汇编语言可以看到，向 map 中插入或者修改 key，最终调用的是 <code>mapassign</code> 函数。</p>
+<p>实际上插入或修改 key 的语法是一样的，只不过前者操作的 key 在 map 中不存在，而后者操作的 key 存在 map 中。</p>
+<p>mapassign 有一个系列的函数，根据 key 类型的不同，编译器会将其优化为相应的“快速函数”。</p>
+<table>
+  <thead>
+      <tr>
+          <th>key 类型</th>
+          <th>插入</th>
+      </tr>
+  </thead>
+  <tbody>
+      <tr>
+          <td>uint32</td>
+          <td>mapassign_fast32(t *maptype, h *hmap, key uint32) unsafe.Pointer</td>
+      </tr>
+      <tr>
+          <td>uint64</td>
+          <td>mapassign_fast64(t *maptype, h *hmap, key uint64) unsafe.Pointer</td>
+      </tr>
+      <tr>
+          <td>string</td>
+          <td>mapassign_faststr(t *maptype, h *hmap, ky string) unsafe.Pointer</td>
+      </tr>
+  </tbody>
+</table>
+<p>我们只用研究最一般的赋值函数 <code>mapassign</code>。</p>
+<p>整体来看，流程非常得简单：对 key 计算 hash 值，根据 hash 值按照之前的流程，找到要赋值的位置（可能是插入新 key，也可能是更新老 key），对相应位置进行赋值。</p>
+<p>源码大体和之前讲的类似，核心还是一个双层循环，外层遍历 bucket 和它的 overflow bucket，内层遍历整个 bucket 的各个 cell。限于篇幅，这部分代码的注释我也不展示了，有兴趣的可以去看，保证理解了这篇文章内容后，能够看懂。</p>
+<p>我这里会针对这个过程提几点重要的。</p>
+<p>函数首先会检查 map 的标志位 flags。如果 flags 的写标志位此时被置 1 了，说明有其他协程在执行“写”操作，进而导致程序 panic。这也说明了 map 对协程是不安全的。</p>
+<p>通过前文我们知道扩容是渐进式的，如果 map 处在扩容的过程中，那么当 key 定位到了某个 bucket 后，需要确保这个 bucket 对应的老 bucket 完成了迁移过程。即老 bucket 里的 key 都要迁移到新的 bucket 中来（分裂到 2 个新 bucket），才能在新的 bucket 中进行插入或者更新的操作。</p>
+<p>上面说的操作是在函数靠前的位置进行的，只有进行完了这个搬迁操作后，我们才能放心地在新 bucket 里定位 key 要安置的地址，再进行之后的操作。</p>
+<p>现在到了定位 key 应该放置的位置了，所谓找准自己的位置很重要。准备两个指针，一个（<code>inserti</code>）指向 key 的 hash 值在 tophash 数组所处的位置，另一个(<code>insertk</code>)指向 cell 的位置（也就是 key 最终放置的地址），当然，对应 value 的位置就很容易定位出来了。这三者实际上都是关联的，在 tophash 数组中的索引位置决定了 key 在整个 bucket 中的位置（共 8 个 key），而 value 的位置需要“跨过” 8 个 key 的长度。</p>
+<p>在循环的过程中，inserti 和 insertk 分别指向第一个找到的空闲的 cell。如果之后在 map 没有找到 key 的存在，也就是说原来 map 中没有此 key，这意味着插入新 key。那最终 key 的安置地址就是第一次发现的“空位”（tophash 是 empty）。</p>
+<p>如果这个 bucket 的 8 个 key 都已经放置满了，那在跳出循环后，发现 inserti 和 insertk 都是空，这时候需要在 bucket 后面挂上 overflow bucket。当然，也有可能是在 overflow bucket 后面再挂上一个 overflow bucket。这就说明，太多 key hash 到了此 bucket。</p>
+<p>在正式安置 key 之前，还要检查 map 的状态，看它是否需要进行扩容。如果满足扩容的条件，就主动触发一次扩容操作。</p>
+<p>这之后，整个之前的查找定位 key 的过程，还得再重新走一次。因为扩容之后，key 的分布都发生了变化。</p>
+<p>最后，会更新 map 相关的值，如果是插入新 key，map 的元素数量字段 count 值会加 1；在函数之初设置的 <code>hashWriting</code> 写标志出会清零。</p>
+<p>另外，有一个重要的点要说一下。前面说的找到 key 的位置，进行赋值操作，实际上并不准确。我们看 <code>mapassign</code> 函数的原型就知道，函数并没有传入 value 值，所以赋值操作是什么时候执行的呢？</p>
+<div class="highlight"><div style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;">
+<table style="border-spacing:0;padding:0;margin:0;border:0;"><tr><td style="vertical-align:top;padding:0;margin:0;border:0;">
+<pre tabindex="0" style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;"><code><span style="white-space:pre;-webkit-user-select:none;user-select:none;margin-right:0.4em;padding:0 0.4em 0 0.4em;color:#7f7f7f">1
+</span></code></pre></td>
+<td style="vertical-align:top;padding:0;margin:0;border:0;;width:100%">
+<pre tabindex="0" style="background-color:#fff;-moz-tab-size:4;-o-tab-size:4;tab-size:4;-webkit-text-size-adjust:none;"><code class="language-golang" data-lang="golang"><span style="display:flex;"><span><span style="color:#00f">func</span> mapassign(t *maptype, h *hmap, key unsafe.Pointer) unsafe.Pointer
+</span></span></code></pre></td></tr></table>
+</div>
+</div><p>答案还得从汇编语言中寻找。我直接揭晓答案，有兴趣可以私下去研究一下。<code>mapassign</code> 函数返回的指针就是指向的 key 所对应的 value 值位置，有了地址，就很好操作赋值了。</p>
+
+    
+  </article>
+ 
+      
+
+      <footer class="book-footer">
+        
+  <div class="flex flex-wrap justify-between">
+
+
+
+
+
+</div>
+
+ 
+        <div class="guide-links">
+
+
+</div>
+
+<div id="footer">
+<img alt="知识共享许可协议" style="border-width:0" src="https://licensebuttons.net/l/by-nc-nd/4.0/80x15.png">
+<p>Go宝典 由 <a href="https://qcrao.com">饶全成</a>, <a href="https://changkun.de">欧长坤</a>, 楚秦等
+采用<a rel="license" href="http://creativecommons.org/licenses/by-nc-nd/4.0/">署名-非商业性使用-禁止演绎 4.0 国际许可协议许可</a><br/>
+严禁任何商业行为使用或引用该文档的全部或部分内容，特授权 <a href="https://golang.design">golang.design/go-questions</a> 发布</p>
+</div>
+
+
+<script async src="https://www.googletagmanager.com/gtag/js?id=UA-80889616-4"></script>
+<script>
+window.dataLayer = window.dataLayer || [];
+function gtag(){dataLayer.push(arguments);}
+gtag('js', new Date());
+gtag('config', 'UA-80889616-4');
+</script>
+
+页面总访问量: <span id="urlstat-page-pv"></span>, 访问的用户数: <span id="urlstat-page-uv"></span>
+
+      </footer>
+
+      
+  
+  <div class="book-comments">
+
+</div>
+  
+ 
+
+      <label for="menu-control" class="hidden book-menu-overlay"></label>
+    </div>
+
+    
+    <aside class="book-toc">
+      <div class="book-toc-content">
+        
+  
+<nav id="TableOfContents"></nav>
+
+
+ 
+      </div>
+    </aside>
+    
+  </main>
+
+  
+</body>
+
+</html>
+
+
+
+
+
+
+
+
+
+
+
+
